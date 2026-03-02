@@ -62,6 +62,8 @@ type Model struct {
 	statusMsg  string
 	statusTime time.Time
 	err        error
+
+	selected map[int]bool
 }
 
 func tagColor(tag string) lipgloss.Color {
@@ -87,6 +89,7 @@ func NewModel(cfg Config, tasks []Task) Model {
 		input:      ti,
 		activeView: viewToday,
 		focus:      focusSidebar,
+		selected:   make(map[int]bool),
 	}
 	m.buildViews()
 	return m
@@ -411,23 +414,39 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if value == "" {
 				return m, nil
 			}
-			task := m.selectedTask()
-			if task == nil {
-				return m, nil
-			}
 			newDate, err := parseRelativeDate(value)
 			if err != nil {
 				m.statusMsg = "Invalid date: " + value
 				m.statusTime = time.Now()
 				return m, nil
 			}
-			if err := RescheduleTask(task, newDate); err != nil {
-				m.err = err
-				m.statusMsg = "Error: " + err.Error()
-			} else {
-				m.statusMsg = "Rescheduled → " + newDate.Format("Jan 02")
+			if len(m.selected) > 0 {
+				count := 0
+				for idx := range m.selected {
+					if err := RescheduleTask(&m.allTasks[idx], newDate); err != nil {
+						m.statusMsg = "Error: " + err.Error()
+						m.statusTime = time.Now()
+						break
+					}
+					count++
+				}
+				m.selected = make(map[int]bool)
+				m.statusMsg = fmt.Sprintf("%d tasks → %s", count, newDate.Format("Jan 02"))
 				m.statusTime = time.Now()
 				m = m.reload()
+			} else {
+				task := m.selectedTask()
+				if task == nil {
+					return m, nil
+				}
+				if err := RescheduleTask(task, newDate); err != nil {
+					m.err = err
+					m.statusMsg = "Error: " + err.Error()
+				} else {
+					m.statusMsg = "Rescheduled → " + newDate.Format("Jan 02")
+					m.statusTime = time.Now()
+					m = m.reload()
+				}
 			}
 		}
 		return m, nil
@@ -469,18 +488,21 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sidebarCursor = 0
 		m.contentCursor = 0
 		m.scrollOffset = 0
+		m.selected = make(map[int]bool)
 
 	case "2":
 		m.activeView = viewUpcoming
 		m.sidebarCursor = 1
 		m.contentCursor = 0
 		m.scrollOffset = 0
+		m.selected = make(map[int]bool)
 
 	case "3":
 		m.activeView = viewLogbook
 		m.sidebarCursor = 2
 		m.contentCursor = 0
 		m.scrollOffset = 0
+		m.selected = make(map[int]bool)
 
 	case "tab":
 		if m.focus == focusSidebar {
@@ -529,7 +551,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.focus == focusSidebar {
 			m.focus = focusContent
-		} else if m.activeView != viewLogbook {
+		} else {
 			task := m.selectedTask()
 			if task != nil {
 				if err := ToggleDone(task); err != nil {
@@ -547,21 +569,65 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case "d":
+	case " ":
 		if m.focus == focusContent && m.activeView != viewLogbook {
-			task := m.selectedTask()
-			if task != nil {
-				if err := ToggleDone(task); err != nil {
-					m.err = err
-					m.statusMsg = "Error: " + err.Error()
+			tasks := m.currentViewTasks()
+			if len(tasks) > 0 && m.contentCursor < len(tasks) {
+				idx := tasks[m.contentCursor]
+				if m.selected[idx] {
+					delete(m.selected, idx)
 				} else {
-					if task.Done {
-						m.statusMsg = "Marked done"
-					} else {
-						m.statusMsg = "Marked undone"
+					m.selected[idx] = true
+				}
+				if m.contentCursor < len(tasks)-1 {
+					m.contentCursor++
+				}
+			}
+		}
+
+	case "v":
+		if m.focus == focusContent && m.activeView != viewLogbook {
+			tasks := m.currentViewTasks()
+			if len(m.selected) > 0 {
+				m.selected = make(map[int]bool)
+			} else {
+				for _, idx := range tasks {
+					m.selected[idx] = true
+				}
+			}
+		}
+
+	case "d":
+		if m.focus == focusContent {
+			if len(m.selected) > 0 && m.activeView != viewLogbook {
+				count := 0
+				for idx := range m.selected {
+					if err := ToggleDone(&m.allTasks[idx]); err != nil {
+						m.statusMsg = "Error: " + err.Error()
+						m.statusTime = time.Now()
+						break
 					}
-					m.statusTime = time.Now()
-					m = m.reload()
+					count++
+				}
+				m.selected = make(map[int]bool)
+				m.statusMsg = fmt.Sprintf("%d tasks marked done", count)
+				m.statusTime = time.Now()
+				m = m.reload()
+			} else {
+				task := m.selectedTask()
+				if task != nil {
+					if err := ToggleDone(task); err != nil {
+						m.err = err
+						m.statusMsg = "Error: " + err.Error()
+					} else {
+						if task.Done {
+							m.statusMsg = "Marked done"
+						} else {
+							m.statusMsg = "Marked undone"
+						}
+						m.statusTime = time.Now()
+						m = m.reload()
+					}
 				}
 			}
 		}
@@ -597,6 +663,13 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "s":
 		if m.focus == focusContent && m.activeView != viewLogbook {
+			if len(m.selected) > 0 {
+				m.mode = modeReschedule
+				m.input.Placeholder = "Date: 2006-01-02, +3d, mon, tomorrow"
+				m.input.SetValue("")
+				m.input.Focus()
+				return m, m.input.Cursor.BlinkCmd()
+			}
 			task := m.selectedTask()
 			if task != nil {
 				m.mode = modeReschedule
@@ -615,7 +688,9 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.input.Cursor.BlinkCmd()
 
 	case "esc":
-		if m.filter != "" {
+		if len(m.selected) > 0 {
+			m.selected = make(map[int]bool)
+		} else if m.filter != "" {
 			m.filter = ""
 			m.buildViews()
 		}
@@ -830,7 +905,7 @@ func (m Model) renderTodayView(maxWidth, maxHeight int) string {
 		}
 		selected := flatIdx == m.contentCursor && isActive
 		isOverdue := i >= m.overdueStart && m.overdueStart < len(m.todayTasks) && m.overdueStart > 0
-		row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, isOverdue)
+		row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, isOverdue, m.selected[taskIdx])
 		rows = append(rows, row)
 		flatIdx++
 	}
@@ -868,7 +943,7 @@ func (m Model) renderUpcomingView(maxWidth, maxHeight int) string {
 
 		for _, taskIdx := range g.Tasks {
 			selected := flatIdx == m.contentCursor && isActive
-			row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, false)
+			row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, false, m.selected[taskIdx])
 			rows = append(rows, row)
 			flatIdx++
 		}
@@ -945,7 +1020,7 @@ func (m Model) renderLogbookView(maxWidth, maxHeight int) string {
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) renderTaskRow(task Task, selected bool, maxWidth int, isOverdue bool) string {
+func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue bool, checked bool) string {
 	bullet := "○"
 	bulletColor := lipgloss.Color("#888888")
 	if task.Done {
@@ -956,9 +1031,13 @@ func (m Model) renderTaskRow(task Task, selected bool, maxWidth int, isOverdue b
 		bulletColor = lipgloss.Color(m.cfg.Theme.Overdue)
 	}
 
+	prefix := "  "
+	if checked {
+		prefix = lipgloss.NewStyle().Foreground(lipgloss.Color(m.cfg.Theme.Accent)).Render("▸ ")
+	}
+
 	bulletStyle := lipgloss.NewStyle().
-		Foreground(bulletColor).
-		PaddingLeft(2)
+		Foreground(bulletColor)
 
 	desc := task.Description
 	descMaxWidth := maxWidth - 8
@@ -986,13 +1065,13 @@ func (m Model) renderTaskRow(task Task, selected bool, maxWidth int, isOverdue b
 	}
 	tagStr := strings.Join(tagParts, " ")
 
-	line := bulletStyle.Render(bullet) + descStyle.Render(desc)
+	line := prefix + bulletStyle.Render(bullet) + descStyle.Render(desc)
 	if tagStr != "" {
 		line += " " + tagStr
 	}
 
 	rowStyle := lipgloss.NewStyle().Width(maxWidth)
-	if selected {
+	if cursor {
 		rowStyle = rowStyle.
 			Background(lipgloss.Color("#2a2a3a")).
 			Bold(true).
@@ -1055,9 +1134,13 @@ func (m Model) renderFooter(width int) string {
 		statusPart = statusStyle.Render(" "+m.statusMsg) + "  "
 	}
 
-	keys := "n new  d done  s reschedule  e edit  D del  / filter  ? help  q quit"
-	if m.activeView == viewLogbook {
-		keys = "←/→ prev/next day  / filter  ? help  q quit"
+	var keys string
+	if len(m.selected) > 0 {
+		keys = fmt.Sprintf("(%d selected) d done  s reschedule  v toggle all  esc clear  ? help  q quit", len(m.selected))
+	} else if m.activeView == viewLogbook {
+		keys = "←/→ prev/next day  d undone  / filter  ? help  q quit"
+	} else {
+		keys = "n new  d done  s reschedule  e edit  D del  space select  v all  / filter  ? help  q quit"
 	}
 
 	keyStyle := lipgloss.NewStyle().
@@ -1084,7 +1167,7 @@ func (m Model) renderHelp() string {
     Tab             Toggle focus
     1/2/3           Today / Upcoming / Logbook
     ←/→             Logbook: prev/next day
-    Enter           Select / toggle done
+    Enter           Toggle done
 
   Actions
     n               New task
@@ -1094,7 +1177,13 @@ func (m Model) renderHelp() string {
     D               Delete task
     /               Filter by text
     r               Reload from files
-    Esc             Clear filter
+
+  Bulk Selection
+    Space           Toggle select
+    v               Select/deselect all
+    d               Mark selected done
+    s               Reschedule selected
+    Esc             Clear selection
 
   Press any key to close.
 `
@@ -1113,15 +1202,51 @@ func parseRelativeDate(input string) (time.Time, error) {
 	input = strings.TrimSpace(strings.ToLower(input))
 	today := time.Now().Truncate(24 * time.Hour)
 
+	if input == "" {
+		return time.Time{}, fmt.Errorf("empty date input")
+	}
+
 	if t, err := time.Parse("2006-01-02", input); err == nil {
 		return t, nil
 	}
 
+	if t, err := time.Parse("01/02", input); err == nil {
+		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
+		if result.Before(today) {
+			result = result.AddDate(1, 0, 0)
+		}
+		return result, nil
+	}
+
+	if t, err := time.Parse("Jan 02", input); err == nil {
+		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
+		if result.Before(today) {
+			result = result.AddDate(1, 0, 0)
+		}
+		return result, nil
+	}
+
+	if t, err := time.Parse("Jan 2", input); err == nil {
+		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
+		if result.Before(today) {
+			result = result.AddDate(1, 0, 0)
+		}
+		return result, nil
+	}
+
 	switch input {
-	case "today":
+	case "today", "tod":
 		return today, nil
-	case "tomorrow", "tmr":
+	case "tomorrow", "tmr", "tom":
 		return today.AddDate(0, 0, 1), nil
+	case "yesterday":
+		return today.AddDate(0, 0, -1), nil
+	case "next week", "nw":
+		d := today.AddDate(0, 0, 1)
+		for d.Weekday() != time.Monday {
+			d = d.AddDate(0, 0, 1)
+		}
+		return d, nil
 	}
 
 	days := map[string]time.Weekday{
@@ -1141,22 +1266,29 @@ func parseRelativeDate(input string) (time.Time, error) {
 		return d, nil
 	}
 
-	if strings.HasPrefix(input, "+") {
-		s := strings.TrimPrefix(input, "+")
-		unit := s[len(s)-1]
-		numStr := s[:len(s)-1]
+	offsetStr := input
+	if strings.HasPrefix(offsetStr, "+") {
+		offsetStr = offsetStr[1:]
+	}
+	if len(offsetStr) >= 2 {
+		unit := offsetStr[len(offsetStr)-1]
+		numStr := offsetStr[:len(offsetStr)-1]
 		var n int
-		if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil {
-			return time.Time{}, fmt.Errorf("invalid offset: %s", input)
+		if _, err := fmt.Sscanf(numStr, "%d", &n); err == nil {
+			switch unit {
+			case 'd':
+				return today.AddDate(0, 0, n), nil
+			case 'w':
+				return today.AddDate(0, 0, n*7), nil
+			case 'm':
+				return today.AddDate(0, n, 0), nil
+			}
 		}
-		switch unit {
-		case 'd':
-			return today.AddDate(0, 0, n), nil
-		case 'w':
-			return today.AddDate(0, 0, n*7), nil
-		case 'm':
-			return today.AddDate(0, n, 0), nil
-		}
+	}
+
+	var plainDays int
+	if _, err := fmt.Sscanf(input, "%d", &plainDays); err == nil {
+		return today.AddDate(0, 0, plainDays), nil
 	}
 
 	return time.Time{}, fmt.Errorf("unrecognized date: %s", input)
