@@ -185,9 +185,6 @@ func ScanDailyNotes(cfg Config) ([]Task, error) {
 			return nil, fmt.Errorf("parsing %s: %w", fp, err)
 		}
 		for _, t := range tasks {
-			if len(t.Tags) == 0 {
-				continue
-			}
 			excluded := false
 			for _, tag := range t.Tags {
 				for _, ex := range cfg.Tasks.ExcludeTags {
@@ -209,15 +206,14 @@ func ScanDailyNotes(cfg Config) ([]Task, error) {
 	return allTasks, nil
 }
 
-// ToggleDone toggles a task's done status in the file.
 func ToggleDone(task *Task) error {
 	lines, err := readLines(task.FilePath)
 	if err != nil {
 		return err
 	}
 	idx := task.LineNumber - 1
-	if idx < 0 || idx >= len(lines) {
-		return fmt.Errorf("line %d out of range", task.LineNumber)
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
 	}
 
 	line := lines[idx]
@@ -244,15 +240,14 @@ func ToggleDone(task *Task) error {
 	return writeLines(task.FilePath, lines)
 }
 
-// DeleteTask removes a task line from its file.
 func DeleteTask(task *Task) error {
 	lines, err := readLines(task.FilePath)
 	if err != nil {
 		return err
 	}
 	idx := task.LineNumber - 1
-	if idx < 0 || idx >= len(lines) {
-		return fmt.Errorf("line %d out of range", task.LineNumber)
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
 	}
 	lines = append(lines[:idx], lines[idx+1:]...)
 	return writeLines(task.FilePath, lines)
@@ -314,15 +309,14 @@ created: %s
 	return writeLines(fp, lines)
 }
 
-// RescheduleTask changes a task's due date in the file.
 func RescheduleTask(task *Task, newDate time.Time) error {
 	lines, err := readLines(task.FilePath)
 	if err != nil {
 		return err
 	}
 	idx := task.LineNumber - 1
-	if idx < 0 || idx >= len(lines) {
-		return fmt.Errorf("line %d out of range", task.LineNumber)
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
 	}
 
 	line := lines[idx]
@@ -345,13 +339,21 @@ func SetPriority(task *Task, priority int) error {
 		return err
 	}
 	idx := task.LineNumber - 1
-	if idx < 0 || idx >= len(lines) {
-		return fmt.Errorf("line %d out of range", task.LineNumber)
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
 	}
 
 	line := lines[idx]
 	line = priorityRe.ReplaceAllString(line, "")
-	line = strings.Join(strings.Fields(line), " ")
+	cbIdx := strings.Index(line, "] ")
+	if cbIdx >= 0 {
+		prefix := line[:cbIdx+2]
+		rest := line[cbIdx+2:]
+		for strings.Contains(rest, "  ") {
+			rest = strings.Replace(rest, "  ", " ", 1)
+		}
+		line = prefix + strings.TrimSpace(rest)
+	}
 
 	if emoji, ok := priorityEmojis[priority]; ok {
 		if loc := dueDateRe.FindStringIndex(line); loc != nil {
@@ -367,15 +369,14 @@ func SetPriority(task *Task, priority int) error {
 	return writeLines(task.FilePath, lines)
 }
 
-// UpdateTaskLine replaces a task's line in its file with new text.
 func UpdateTaskLine(task *Task, newLine string) error {
 	lines, err := readLines(task.FilePath)
 	if err != nil {
 		return err
 	}
 	idx := task.LineNumber - 1
-	if idx < 0 || idx >= len(lines) {
-		return fmt.Errorf("line %d out of range", task.LineNumber)
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
 	}
 	lines[idx] = newLine
 	task.RawLine = newLine
@@ -391,9 +392,7 @@ func readLines(path string) ([]string, error) {
 	if content == "" {
 		return []string{}, nil
 	}
-	// Preserve trailing newline by not trimming
 	lines := strings.Split(content, "\n")
-	// Remove last empty element caused by trailing newline
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
@@ -402,5 +401,23 @@ func readLines(path string) ([]string, error) {
 
 func writeLines(path string, lines []string) error {
 	content := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(path, []byte(content), 0644)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+	return nil
+}
+
+func verifyLine(lines []string, idx int, rawLine string) error {
+	if idx < 0 || idx >= len(lines) {
+		return fmt.Errorf("line %d out of range (file has %d lines)", idx+1, len(lines))
+	}
+	if lines[idx] != rawLine {
+		return fmt.Errorf("file changed externally, please reload (r)")
+	}
+	return nil
 }
