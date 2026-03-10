@@ -177,12 +177,12 @@ func ScanDailyNotes(cfg Config) ([]Task, error) {
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		filename := d.Format(cfg.Vault.DailyNoteFormat) + ".md"
 		fp := filepath.Join(dir, filename)
-		if _, err := os.Stat(fp); os.IsNotExist(err) {
+		if _, err := os.Stat(fp); err != nil {
 			continue
 		}
 		tasks, err := ParseFile(fp, d, cfg.Tasks.SectionHeading)
 		if err != nil {
-			return nil, fmt.Errorf("parsing %s: %w", fp, err)
+			continue
 		}
 		for _, t := range tasks {
 			excluded := false

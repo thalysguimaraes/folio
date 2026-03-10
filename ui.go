@@ -138,10 +138,10 @@ func (m *Model) buildViews() {
 		if !m.matchesFilter(t) {
 			continue
 		}
-		due := t.DueDate.Truncate(24 * time.Hour)
+		due := time.Date(t.DueDate.Year(), t.DueDate.Month(), t.DueDate.Day(), 0, 0, 0, 0, today.Location())
 
 		if t.Done {
-			compDate := t.CompletionDate.Truncate(24 * time.Hour)
+			compDate := time.Date(t.CompletionDate.Year(), t.CompletionDate.Month(), t.CompletionDate.Day(), 0, 0, 0, 0, today.Location())
 			if compDate.IsZero() {
 				compDate = due
 			}
@@ -1075,9 +1075,10 @@ func (m Model) renderLogbookView(maxWidth, maxHeight int) string {
 		Bold(true)
 	dateLabel := g.Date.Format("Mon, Jan 02 2006")
 	today := localToday()
-	if g.Date.Truncate(24*time.Hour).Equal(today) {
+	gDate := time.Date(g.Date.Year(), g.Date.Month(), g.Date.Day(), 0, 0, 0, 0, today.Location())
+	if gDate.Equal(today) {
 		dateLabel = "Today · " + g.Date.Format("Jan 02")
-	} else if g.Date.Truncate(24*time.Hour).Equal(today.AddDate(0, 0, -1)) {
+	} else if gDate.Equal(today.AddDate(0, 0, -1)) {
 		dateLabel = "Yesterday · " + g.Date.Format("Jan 02")
 	}
 	title := leftArrow + titleStyle.Render(fmt.Sprintf(" %s ", dateLabel)) + rightArrow
