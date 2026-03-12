@@ -3,10 +3,13 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
+
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func TestBuildViewsShowsEmptyTodayLogbookGroupBeforeYesterday(t *testing.T) {
 	today := localToday()
@@ -115,6 +118,62 @@ func TestWatchEventReloadsEvenDuringInternalWriteGracePeriod(t *testing.T) {
 	if _, err := os.Stat(notePath); err != nil {
 		t.Fatalf("expected daily note to exist after reload, got %v", err)
 	}
+}
+
+func TestRenderTodayViewPrioritySeparatorsDefaultOn(t *testing.T) {
+	today := localToday()
+	m := Model{
+		cfg: DefaultConfig(),
+		allTasks: []Task{
+			{Description: "Urgent", Priority: PriorityHighest, DueDate: today},
+			{Description: "Important", Priority: PriorityHigh, DueDate: today},
+			{Description: "Other", Priority: PriorityMedium, DueDate: today},
+			{Description: "Low", Priority: PriorityLow, DueDate: today},
+		},
+		showPrioritySeparators: true,
+	}
+
+	m.buildViews()
+
+	plain := ansiRE.ReplaceAllString(m.renderTodayView(80, 20), "")
+
+	if !strings.Contains(plain, "P1 > Urgent Tasks") {
+		t.Fatalf("expected urgent separator label")
+	}
+	if !strings.Contains(plain, "P2 > Important Tasks") {
+		t.Fatalf("expected important separator label")
+	}
+	if !strings.Contains(plain, "P3+ > Other Tasks") {
+		t.Fatalf("expected other separator label")
+	}
+
+	if !sectionHasPadding(plain, "P2 > Important Tasks") {
+		t.Fatalf("expected spacing around important task section")
+	}
+	if !sectionHasPadding(plain, "P3+ > Other Tasks") {
+		t.Fatalf("expected spacing around other task section")
+	}
+
+	m.showPrioritySeparators = false
+	disabled := ansiRE.ReplaceAllString(m.renderTodayView(80, 20), "")
+	if strings.Contains(disabled, "P1 >") || strings.Contains(disabled, "P2 >") || strings.Contains(disabled, "P3+ >") {
+		t.Fatalf("expected priority separator labels to be hidden when disabled")
+	}
+}
+
+func sectionHasPadding(text, sectionLabel string) bool {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if !strings.Contains(line, sectionLabel) {
+			continue
+		}
+		if i > 0 && strings.TrimSpace(lines[i-1]) == "" {
+			if i+1 < len(lines) && strings.TrimSpace(lines[i+1]) == "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func testConfigWithTempVault(t *testing.T) Config {

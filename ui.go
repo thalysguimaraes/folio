@@ -69,6 +69,8 @@ type Model struct {
 	preserveStatusUntil time.Time
 
 	selected map[int]bool
+
+	showPrioritySeparators bool
 }
 
 func tagColor(tag string) lipgloss.Color {
@@ -88,13 +90,14 @@ func NewModel(cfg Config, tasks []Task) Model {
 	ti.Width = 50
 
 	m := Model{
-		cfg:        cfg,
-		allTasks:   tasks,
-		mode:       modeNormal,
-		input:      ti,
-		activeView: viewToday,
-		focus:      focusSidebar,
-		selected:   make(map[int]bool),
+		cfg:                    cfg,
+		allTasks:               tasks,
+		mode:                   modeNormal,
+		input:                  ti,
+		activeView:             viewToday,
+		focus:                  focusSidebar,
+		selected:               make(map[int]bool),
+		showPrioritySeparators: true,
 	}
 	watcher, err := newDailyNotesWatcher(cfg)
 	if err != nil {
@@ -861,6 +864,15 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.mode = modeHelp
 
+	case "t":
+		m.showPrioritySeparators = !m.showPrioritySeparators
+		state := "off"
+		if m.showPrioritySeparators {
+			state = "on"
+		}
+		m.statusMsg = "Priority separators " + state
+		m.statusTime = time.Now()
+
 	case "r":
 		m = m.reload()
 		if m.err == nil {
@@ -1053,18 +1065,34 @@ func (m Model) renderTodayView(maxWidth, maxHeight int) string {
 	}
 
 	flatIdx := 0
-	for i, taskIdx := range m.todayTasks {
-		if i == m.overdueStart && m.overdueStart > 0 && m.overdueStart < len(m.todayTasks) {
-			sepStyle := lipgloss.NewStyle().
-				Foreground(lipgloss.Color(m.cfg.Theme.Overdue))
-			sep := fmt.Sprintf("  ── Overdue %s", strings.Repeat("─", max(0, maxWidth-14)))
-			rows = append(rows, sepStyle.Render(sep))
+	if m.overdueStart > 0 && m.overdueStart < len(m.todayTasks) {
+		overdueStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(m.cfg.Theme.Overdue))
+		sep := fmt.Sprintf("  ── Overdue %s", strings.Repeat("─", max(0, maxWidth-14)))
+		rows = append(rows, overdueStyle.Render(sep))
+	}
+
+	if m.overdueStart > 0 {
+		groupRows, consumed := m.renderPrioritySeparatedRows(m.todayTasks[:m.overdueStart], maxWidth, 0, isActive, flatIdx, false)
+		rows = append(rows, groupRows...)
+		flatIdx += consumed
+	}
+
+	if len(m.todayTasks) > m.overdueStart {
+		if m.overdueStart > 0 && len(m.todayTasks[:m.overdueStart]) > 0 {
+			rows = append(rows, "")
 		}
-		selected := flatIdx == m.contentCursor && isActive
-		isOverdue := i >= m.overdueStart && m.overdueStart < len(m.todayTasks) && m.overdueStart > 0
-		row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, isOverdue, m.selected[taskIdx])
-		rows = append(rows, row)
-		flatIdx++
+		overdueRows, consumed := m.renderPrioritySeparatedRows(m.todayTasks[m.overdueStart:], maxWidth, m.overdueStart, isActive, flatIdx, true)
+		rows = append(rows, overdueRows...)
+		flatIdx += consumed
+	} else if m.overdueStart == 0 {
+		dueRows, consumed := m.renderPrioritySeparatedRows(m.todayTasks, maxWidth, 0, isActive, flatIdx, false)
+		rows = append(rows, dueRows...)
+		flatIdx += consumed
+	}
+
+	if flatIdx != len(m.todayTasks) {
+		rows = append(rows, "")
 	}
 
 	return strings.Join(rows, "\n")
@@ -1098,16 +1126,70 @@ func (m Model) renderUpcomingView(maxWidth, maxHeight int) string {
 		header := fmt.Sprintf("  ── %s %s", g.Label, strings.Repeat("─", max(0, maxWidth-len(g.Label)-6)))
 		rows = append(rows, headerStyle.Render(header))
 
-		for _, taskIdx := range g.Tasks {
-			selected := flatIdx == m.contentCursor && isActive
-			row := m.renderTaskRow(m.allTasks[taskIdx], selected, maxWidth, false, m.selected[taskIdx])
-			rows = append(rows, row)
-			flatIdx++
-		}
+		taskRows, consumed := m.renderPrioritySeparatedRows(g.Tasks, maxWidth, 0, isActive, flatIdx, false)
+		rows = append(rows, taskRows...)
+		flatIdx += consumed
 		rows = append(rows, "")
 	}
 
 	return strings.Join(rows, "\n")
+}
+
+func prioritySectionLabel(priority int) (label string, color string) {
+	switch priority {
+	case PriorityHighest:
+		return "P1 > Urgent Tasks", "#ff4d4f"
+	case PriorityHigh:
+		return "P2 > Important Tasks", "#f5c242"
+	default:
+		return "P3+ > Other Tasks", "#8e8e8e"
+	}
+}
+
+func (m Model) renderPrioritySeparator(label string, maxWidth int, color string) string {
+	sep := fmt.Sprintf("  ── %s ", label)
+	pad := max(0, maxWidth-len(sep)-6)
+	line := fmt.Sprintf("  ── %s %s", label, strings.Repeat("─", pad))
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(color)).
+		Render(line)
+}
+
+func (m Model) renderPrioritySeparatedRows(taskIndices []int, maxWidth int, cursorOffset int, isActive bool, cursor int, isOverdue bool) ([]string, int) {
+	if len(taskIndices) == 0 {
+		return nil, 0
+	}
+
+	var rows []string
+	previous := ""
+	if cursorOffset < 0 {
+		cursorOffset = 0
+	}
+
+	if m.showPrioritySeparators {
+		firstTask := m.allTasks[taskIndices[0]]
+		firstSection, firstColor := prioritySectionLabel(firstTask.Priority)
+		rows = append(rows, "")
+		rows = append(rows, m.renderPrioritySeparator(firstSection, maxWidth, firstColor))
+		rows = append(rows, "")
+		previous = firstSection
+	}
+
+	for localIdx, taskIdx := range taskIndices {
+		task := m.allTasks[taskIdx]
+		section, color := prioritySectionLabel(task.Priority)
+		if m.showPrioritySeparators && localIdx > 0 && section != previous {
+			rows = append(rows, "")
+			rows = append(rows, m.renderPrioritySeparator(section, maxWidth, color))
+			rows = append(rows, "")
+		}
+		selected := (localIdx+cursorOffset) == cursor && isActive
+		row := m.renderTaskRow(task, selected, maxWidth, isOverdue, m.selected[taskIdx])
+		rows = append(rows, row)
+		previous = section
+	}
+
+	return rows, len(taskIndices)
 }
 
 func (m Model) renderLogbookView(maxWidth, maxHeight int) string {
@@ -1321,7 +1403,11 @@ func (m Model) renderFooter(width int) string {
 	} else if m.activeView == viewLogbook {
 		keys = "←/→ prev/next day  d reopen  / filter  ? help  q quit"
 	} else {
-		keys = "n new  d done  f follow-up  s reschedule  p priority  e edit  D cancel  space select  v all  / filter  ? help"
+		toggleState := "off"
+		if m.showPrioritySeparators {
+			toggleState = "on"
+		}
+		keys = fmt.Sprintf("n new  d done  f follow-up  s reschedule  p priority  e edit  D cancel  t separators(%s)  space select  v all  / filter  ? help", toggleState)
 	}
 
 	keyStyle := lipgloss.NewStyle().
@@ -1357,6 +1443,7 @@ func (m Model) renderHelp() string {
     f               Create follow-up for tomorrow
     s               Reschedule task
     p               Set priority
+    t               Toggle priority separators
     D               Cancel task
     /               Filter by text
     r               Reload from files

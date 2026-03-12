@@ -87,6 +87,7 @@ The only required field is `vault.path`. Everything else has sensible defaults.
 | `e` | Edit task |
 | `d` | Toggle done / reopen |
 | `f` | Create follow-up for tomorrow |
+| `t` | Toggle priority separators |
 | `D` | Cancel task |
 | `/` | Filter by text |
 | `Esc` | Clear filter |
