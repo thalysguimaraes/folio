@@ -1,12 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -158,6 +162,148 @@ func TestRenderTodayViewPrioritySeparatorsDefaultOn(t *testing.T) {
 	disabled := ansiRE.ReplaceAllString(m.renderTodayView(80, 20), "")
 	if strings.Contains(disabled, "P1 >") || strings.Contains(disabled, "P2 >") || strings.Contains(disabled, "P3+ >") {
 		t.Fatalf("expected priority separator labels to be hidden when disabled")
+	}
+}
+
+func TestRenderTodayViewOverdueTasksStayInPrioritySections(t *testing.T) {
+	today := localToday()
+	yesterday := today.AddDate(0, 0, -1)
+
+	m := Model{
+		cfg: DefaultConfig(),
+		allTasks: []Task{
+			{Description: "Overdue urgent", Priority: PriorityHighest, DueDate: yesterday},
+			{Description: "Today urgent", Priority: PriorityHighest, DueDate: today},
+			{Description: "Today important", Priority: PriorityHigh, DueDate: today},
+			{Description: "Low", Priority: PriorityLow, DueDate: today},
+		},
+		showPrioritySeparators: true,
+	}
+
+	m.buildViews()
+
+	plain := ansiRE.ReplaceAllString(m.renderTodayView(100, 40), "")
+
+	if strings.Count(plain, "P1 > Urgent Tasks") != 1 {
+		t.Fatalf("expected one urgent priority header, got %d", strings.Count(plain, "P1 > Urgent Tasks"))
+	}
+	if strings.Count(plain, "P2 > Important Tasks") != 1 {
+		t.Fatalf("expected one important priority header, got %d", strings.Count(plain, "P2 > Important Tasks"))
+	}
+	if strings.Count(plain, "P3+ > Other Tasks") != 1 {
+		t.Fatalf("expected one other priority header, got %d", strings.Count(plain, "P3+ > Other Tasks"))
+	}
+
+	overduePos := strings.Index(plain, "Overdue urgent")
+	todayPos := strings.Index(plain, "Today urgent")
+	if overduePos == -1 || todayPos == -1 {
+		t.Fatalf("expected both overdue and today tasks in output; got:\n%s", plain)
+	}
+	if overduePos > todayPos {
+		t.Fatalf("expected overdue task to be shown before same-priority today task")
+	}
+
+	if strings.Contains(plain, "  ── Overdue") {
+		t.Fatalf("did not expect extra overdue section header in today view")
+	}
+}
+
+func TestRenderTodayViewClipsToViewportHeight(t *testing.T) {
+	today := localToday()
+	var tasks []Task
+	for i := 0; i < 25; i++ {
+		tasks = append(tasks, Task{
+			Description: fmt.Sprintf("Task %02d", i),
+			DueDate:     today,
+			Priority:    PriorityMedium,
+		})
+	}
+
+	m := Model{
+		cfg:                    DefaultConfig(),
+		allTasks:               tasks,
+		focus:                  focusContent,
+		showPrioritySeparators: true,
+	}
+	m.buildViews()
+	m.contentCursor = len(m.todayTasks) - 1
+
+	plain := ansiRE.ReplaceAllString(m.renderTodayView(80, 8), "")
+	lines := strings.Split(plain, "\n")
+	if len(lines) > 8 {
+		t.Fatalf("expected view to be clipped to 8 rows, got %d", len(lines))
+	}
+	if !strings.Contains(plain, "Task 24") {
+		t.Fatalf("expected selected task to be visible after scroll: %s", plain)
+	}
+}
+
+func TestRenderTodayViewOverdueRowStyling(t *testing.T) {
+	today := localToday()
+	yesterday := today.AddDate(0, 0, -1)
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	lipgloss.SetHasDarkBackground(true)
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(termenv.Ascii)
+		lipgloss.SetHasDarkBackground(false)
+	})
+
+	m := Model{
+		cfg: DefaultConfig(),
+		allTasks: []Task{
+			{Description: "Overdue urgent", Priority: PriorityHighest, DueDate: yesterday},
+			{Description: "Today urgent", Priority: PriorityHighest, DueDate: today},
+		},
+		showPrioritySeparators: false,
+	}
+
+	m.buildViews()
+	rows, _ := m.renderTodayRows(120)
+
+	overdueMarker := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Overdue)).
+		Render("Overdue urgent")
+	todayMarker := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Overdue)).
+		Render("Today urgent")
+
+	overdueRow := ""
+	todayRow := ""
+	for _, row := range rows {
+		if strings.Contains(row, "Overdue urgent") {
+			overdueRow = row
+		}
+		if strings.Contains(row, "Today urgent") {
+			todayRow = row
+		}
+	}
+
+	if overdueRow == "" {
+		t.Fatalf("expected overdue task row in rendered output")
+	}
+	if todayRow == "" {
+		t.Fatalf("expected today task row in rendered output")
+	}
+
+	if !strings.Contains(overdueRow, overdueMarker) {
+		t.Fatalf("expected overdue row to include overdue color styling")
+	}
+	if strings.Contains(todayRow, todayMarker) {
+		t.Fatalf("did not expect overdue styling on non-overdue task")
+	}
+}
+
+func TestRenderTodayViewOverdueUsesLocalDateNotTimezone(t *testing.T) {
+	today := localToday()
+	dueDate := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	task := Task{
+		Description: "UTC due today",
+		DueDate:     dueDate,
+		Priority:    PriorityMedium,
+	}
+
+	if isTaskOverdue(task, today) {
+		t.Fatalf("expected UTC task dated today to be non-overdue in local-date comparison")
 	}
 }
 
