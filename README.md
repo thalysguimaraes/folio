@@ -105,7 +105,7 @@ Tasks follow the [Obsidian Tasks](https://publish.obsidian.md/tasks/Introduction
 - [-] Cancelled task #tag 📅 2026-02-28 ❌ 2026-02-28
 ```
 
-New tasks created via the TUI are written into the daily note file under the configured section heading.
+New tasks created via the TUI are written into the daily note file under the configured section heading. Creation accepts explicit due-date markers such as `📅 amanhã`, `para próxima seg`, `em 2 semanas` after `📅`, `due next mon`, or `📅 2026-03-01`.
 
 Follow-ups use the same write path, preserving the current task's tags and priority, and schedule the new task for the next local day.
 

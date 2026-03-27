@@ -103,7 +103,7 @@ The yatto UI uses a **2-pane layout**: project list on the left, task list on th
 ### New Task Flow:
 1. Press `n`
 2. Inline text input appears at the bottom
-3. Type: `Task description #tag 📅 2026-03-01` (date optional, defaults to today)
+3. Type: `Task description #tag para próxima seg`, `Task description #tag due tomorrow`, or `Task description #tag 📅 2026-03-01` (date optional, defaults to today)
 4. Press Enter → task is written to the appropriate daily note
 
 ## File Operations

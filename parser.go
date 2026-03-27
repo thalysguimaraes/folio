@@ -76,7 +76,7 @@ func ParseTask(line string, filePath string, lineNumber int, noteDate time.Time)
 	// Extract due date
 	var dueDate time.Time
 	if dm := dueDateRe.FindStringSubmatch(rest); dm != nil {
-		if t, err := time.Parse("2006-01-02", dm[1]); err == nil {
+		if t, err := parseStoredDate(dm[1], noteDate.Location()); err == nil {
 			dueDate = t
 		}
 	}
@@ -87,14 +87,14 @@ func ParseTask(line string, filePath string, lineNumber int, noteDate time.Time)
 	// Extract completion date
 	var completionDate time.Time
 	if cm := doneDateRe.FindStringSubmatch(rest); cm != nil {
-		if t, err := time.Parse("2006-01-02", cm[1]); err == nil {
+		if t, err := parseStoredDate(cm[1], noteDate.Location()); err == nil {
 			completionDate = t
 		}
 	}
 
 	var cancelledDate time.Time
 	if cm := cancelledDateRe.FindStringSubmatch(rest); cm != nil {
-		if t, err := time.Parse("2006-01-02", cm[1]); err == nil {
+		if t, err := parseStoredDate(cm[1], noteDate.Location()); err == nil {
 			cancelledDate = t
 		}
 	}

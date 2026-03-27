@@ -505,31 +505,20 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if value == "" {
 				return m, nil
 			}
-			dueDate := localToday()
+			defaultDueDate := localToday()
 			if m.activeView == viewUpcoming && len(m.upcomingGroups) > 0 {
 				groupIdx := m.groupIndexForCursor()
 				if groupIdx >= 0 && groupIdx < len(m.upcomingGroups) {
-					dueDate = m.upcomingGroups[groupIdx].Date
+					defaultDueDate = m.upcomingGroups[groupIdx].Date
 				}
 			}
-			if dm := dueDateRe.FindStringSubmatch(value); dm != nil {
-				if t, err := time.Parse("2006-01-02", dm[1]); err == nil {
-					dueDate = t
-				}
-				value = dueDateRe.ReplaceAllString(value, "")
-				value = strings.TrimSpace(value)
+			draft, err := parseTaskDraftInput(value, defaultDueDate, localToday())
+			if err != nil {
+				m.err = err
+				m.statusMsg = "Error: " + err.Error()
+				return m, nil
 			}
-			priority := PriorityNone
-			pMap := map[string]int{"p1": PriorityHighest, "p2": PriorityHigh, "p3": PriorityMedium, "p4": PriorityLow, "p5": PriorityLowest}
-			for token, p := range pMap {
-				if strings.Contains(" "+value+" ", " "+token+" ") {
-					priority = p
-					value = strings.Replace(value, token, "", 1)
-					value = strings.TrimSpace(value)
-					break
-				}
-			}
-			if err := CreateTask(m.cfg, value, dueDate, priority); err != nil {
+			if err := CreateTask(m.cfg, draft.Description, draft.DueDate, draft.Priority); err != nil {
 				m.err = err
 				m.statusMsg = "Error: " + err.Error()
 			} else {
@@ -810,7 +799,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n":
 		if m.activeView != viewLogbook {
 			m.mode = modeNewTask
-			m.input.Placeholder = "Task description #tag p1-p5"
+			m.input.Placeholder = "Task description #tag p1-p5 📅 amanhã"
 			m.input.SetValue("")
 			m.input.Focus()
 			return m, m.input.Cursor.BlinkCmd()
@@ -840,7 +829,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == focusContent && m.activeView != viewLogbook {
 			if len(m.selected) > 0 {
 				m.mode = modeReschedule
-				m.input.Placeholder = "Date: 2006-01-02, +3d, mon, tomorrow"
+				m.input.Placeholder = "Date: amanhã, próxima seg, em 2 semanas, 2026-03-01"
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, m.input.Cursor.BlinkCmd()
@@ -848,7 +837,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			task := m.selectedTask()
 			if task != nil {
 				m.mode = modeReschedule
-				m.input.Placeholder = "Date: 2006-01-02, +3d, mon, tomorrow"
+				m.input.Placeholder = "Date: amanhã, próxima seg, em 2 semanas, 2026-03-01"
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, m.input.Cursor.BlinkCmd()
@@ -1562,98 +1551,5 @@ func (m Model) renderHelp() string {
 }
 
 func parseRelativeDate(input string) (time.Time, error) {
-	input = strings.TrimSpace(strings.ToLower(input))
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-
-	if input == "" {
-		return time.Time{}, fmt.Errorf("empty date input")
-	}
-
-	if t, err := time.Parse("2006-01-02", input); err == nil {
-		return t, nil
-	}
-
-	if t, err := time.Parse("01/02", input); err == nil {
-		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
-		if result.Before(today) {
-			result = result.AddDate(1, 0, 0)
-		}
-		return result, nil
-	}
-
-	if t, err := time.Parse("Jan 02", input); err == nil {
-		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
-		if result.Before(today) {
-			result = result.AddDate(1, 0, 0)
-		}
-		return result, nil
-	}
-
-	if t, err := time.Parse("Jan 2", input); err == nil {
-		result := time.Date(today.Year(), t.Month(), t.Day(), 0, 0, 0, 0, today.Location())
-		if result.Before(today) {
-			result = result.AddDate(1, 0, 0)
-		}
-		return result, nil
-	}
-
-	switch input {
-	case "today", "tod":
-		return today, nil
-	case "tomorrow", "tmr", "tom":
-		return today.AddDate(0, 0, 1), nil
-	case "yesterday":
-		return today.AddDate(0, 0, -1), nil
-	case "next week", "nw":
-		d := today.AddDate(0, 0, 1)
-		for d.Weekday() != time.Monday {
-			d = d.AddDate(0, 0, 1)
-		}
-		return d, nil
-	}
-
-	days := map[string]time.Weekday{
-		"mon": time.Monday, "monday": time.Monday,
-		"tue": time.Tuesday, "tuesday": time.Tuesday,
-		"wed": time.Wednesday, "wednesday": time.Wednesday,
-		"thu": time.Thursday, "thursday": time.Thursday,
-		"fri": time.Friday, "friday": time.Friday,
-		"sat": time.Saturday, "saturday": time.Saturday,
-		"sun": time.Sunday, "sunday": time.Sunday,
-	}
-	if wd, ok := days[input]; ok {
-		d := today.AddDate(0, 0, 1)
-		for d.Weekday() != wd {
-			d = d.AddDate(0, 0, 1)
-		}
-		return d, nil
-	}
-
-	offsetStr := input
-	if strings.HasPrefix(offsetStr, "+") {
-		offsetStr = offsetStr[1:]
-	}
-	if len(offsetStr) >= 2 {
-		unit := offsetStr[len(offsetStr)-1]
-		numStr := offsetStr[:len(offsetStr)-1]
-		var n int
-		if _, err := fmt.Sscanf(numStr, "%d", &n); err == nil {
-			switch unit {
-			case 'd':
-				return today.AddDate(0, 0, n), nil
-			case 'w':
-				return today.AddDate(0, 0, n*7), nil
-			case 'm':
-				return today.AddDate(0, n, 0), nil
-			}
-		}
-	}
-
-	var plainDays int
-	if _, err := fmt.Sscanf(input, "%d", &plainDays); err == nil {
-		return today.AddDate(0, 0, plainDays), nil
-	}
-
-	return time.Time{}, fmt.Errorf("unrecognized date: %s", input)
+	return parseNaturalDate(input, localToday())
 }
