@@ -238,6 +238,43 @@ func TestRenderTodayViewClipsToViewportHeight(t *testing.T) {
 	}
 }
 
+func TestRenderTodayViewShowsAllClearEmptyState(t *testing.T) {
+	m := Model{
+		cfg:                    DefaultConfig(),
+		showPrioritySeparators: true,
+	}
+
+	m.buildViews()
+
+	rows, _ := m.renderTodayRows(80)
+	plain := ansiRE.ReplaceAllString(strings.Join(rows, "\n"), "")
+
+	if !strings.Contains(plain, "All clear") {
+		t.Fatalf("expected all clear title in empty state, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "Day complete") {
+		t.Fatalf("expected day complete kicker in empty state, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "^v^") {
+		t.Fatalf("expected ascii illustration in empty state, got:\n%s", plain)
+	}
+}
+
+func TestRenderTodayViewEmptyStateClipsToViewportHeight(t *testing.T) {
+	m := Model{
+		cfg:                    DefaultConfig(),
+		showPrioritySeparators: true,
+	}
+
+	m.buildViews()
+
+	plain := ansiRE.ReplaceAllString(m.renderTodayView(80, 8), "")
+	lines := strings.Split(plain, "\n")
+	if len(lines) > 8 {
+		t.Fatalf("expected empty state to be clipped to 8 rows, got %d", len(lines))
+	}
+}
+
 func TestRenderTodayViewOverdueRowStyling(t *testing.T) {
 	today := localToday()
 	yesterday := today.AddDate(0, 0, -1)
@@ -293,6 +330,46 @@ func TestRenderTodayViewOverdueRowStyling(t *testing.T) {
 	}
 }
 
+func TestRenderTodayViewBlockedRowStyling(t *testing.T) {
+	today := localToday()
+
+	m := Model{
+		cfg: DefaultConfig(),
+		allTasks: []Task{
+			{Description: "Waiting on vendor", Blocked: true, DueDate: today, Priority: PriorityMedium},
+			{Description: "Ready to ship", DueDate: today, Priority: PriorityMedium},
+		},
+		showPrioritySeparators: false,
+	}
+
+	m.buildViews()
+	rows, _ := m.renderTodayRows(120)
+
+	blockedRow := ""
+	normalRow := ""
+	for _, row := range rows {
+		if strings.Contains(row, "Waiting on vendor") {
+			blockedRow = ansiRE.ReplaceAllString(row, "")
+		}
+		if strings.Contains(row, "Ready to ship") {
+			normalRow = ansiRE.ReplaceAllString(row, "")
+		}
+	}
+
+	if blockedRow == "" {
+		t.Fatalf("expected blocked task row in rendered output")
+	}
+	if !strings.Contains(blockedRow, "◆") {
+		t.Fatalf("expected blocked task row to use blocked bullet, got %q", blockedRow)
+	}
+	if !strings.Contains(blockedRow, "blocked") {
+		t.Fatalf("expected blocked task row to include blocked label, got %q", blockedRow)
+	}
+	if strings.Contains(normalRow, "blocked") {
+		t.Fatalf("did not expect normal task row to include blocked label, got %q", normalRow)
+	}
+}
+
 func TestRenderTodayViewOverdueUsesLocalDateNotTimezone(t *testing.T) {
 	today := localToday()
 	dueDate := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
@@ -328,7 +405,8 @@ func testConfigWithTempVault(t *testing.T) Config {
 	cfg := DefaultConfig()
 	cfg.Vault.Path = t.TempDir()
 	cfg.Vault.DailyNotesDir = "daily"
-	cfg.Tasks.SectionHeading = "## Open Space"
+	cfg.Tasks.SectionHeadings = []string{"## Open Space"}
+	cfg.Tasks.SectionHeading = ""
 	cfg.Tasks.ExcludeTags = nil
 
 	dailyDir := filepath.Join(cfg.Vault.Path, cfg.Vault.DailyNotesDir)
@@ -348,7 +426,7 @@ func writeDailyNote(t *testing.T, cfg Config, day time.Time, taskLines []string)
 		day.Format(cfg.Vault.DailyNoteFormat)+".md",
 	)
 
-	lines := []string{cfg.Tasks.SectionHeading, ""}
+	lines := []string{cfg.Tasks.EffectiveSectionHeadings()[0], ""}
 	lines = append(lines, taskLines...)
 	content := strings.Join(lines, "\n") + "\n"
 	if err := os.WriteFile(notePath, []byte(content), 0o644); err != nil {

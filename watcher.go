@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -10,8 +11,9 @@ import (
 )
 
 type fileWatchMsg struct {
-	at  time.Time
-	err error
+	at    time.Time
+	paths []string
+	err   error
 }
 
 type dailyNotesWatcher struct {
@@ -41,6 +43,7 @@ func newDailyNotesWatcher(cfg Config) (*dailyNotesWatcher, error) {
 
 		var debounce *time.Timer
 		var debounceC <-chan time.Time
+		pendingPaths := make(map[string]struct{})
 
 		resetDebounce := func() {
 			if debounce == nil {
@@ -66,10 +69,17 @@ func newDailyNotesWatcher(cfg Config) (*dailyNotesWatcher, error) {
 				if !isRelevantDailyNoteEvent(event) {
 					continue
 				}
+				pendingPaths[event.Name] = struct{}{}
 				resetDebounce()
 			case <-debounceC:
 				debounceC = nil
-				w.enqueue(fileWatchMsg{at: time.Now()})
+				paths := make([]string, 0, len(pendingPaths))
+				for path := range pendingPaths {
+					paths = append(paths, path)
+				}
+				sort.Strings(paths)
+				pendingPaths = make(map[string]struct{})
+				w.enqueue(fileWatchMsg{at: time.Now(), paths: paths})
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return

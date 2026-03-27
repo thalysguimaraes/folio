@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -37,6 +38,7 @@ var emojiToPriority = map[string]int{
 
 type Task struct {
 	Description    string
+	Blocked        bool
 	Done           bool
 	Cancelled      bool
 	Tags           []string
@@ -50,7 +52,7 @@ type Task struct {
 }
 
 var (
-	taskRe          = regexp.MustCompile(`^(\s*)-\s\[([ xX-])\]\s*(.*)$`)
+	taskRe          = regexp.MustCompile(`^(\s*)-\s\[([ xXbB-])\]\s*(.*)$`)
 	tagRe           = regexp.MustCompile(`#[\w]+(?:/[\w]+)*`)
 	dueDateRe       = regexp.MustCompile(`📅\s*(\d{4}-\d{2}-\d{2})`)
 	doneDateRe      = regexp.MustCompile(`✅\s*(\d{4}-\d{2}-\d{2})`)
@@ -68,6 +70,7 @@ func ParseTask(line string, filePath string, lineNumber int, noteDate time.Time)
 
 	done := m[2] == "x" || m[2] == "X"
 	cancelled := m[2] == "-"
+	blocked := m[2] == "b" || m[2] == "B"
 	rest := m[3]
 
 	// Extract tags
@@ -116,6 +119,7 @@ func ParseTask(line string, filePath string, lineNumber int, noteDate time.Time)
 
 	return &Task{
 		Description:    desc,
+		Blocked:        blocked,
 		Done:           done,
 		Cancelled:      cancelled,
 		Tags:           tags,
@@ -143,40 +147,49 @@ func (t Task) ClosedDate() time.Time {
 	return time.Time{}
 }
 
-// ParseFile reads a daily note and extracts tasks within the given section.
-// If sectionHeading is empty, all tasks in the file are returned.
-func ParseFile(filePath string, noteDate time.Time, sectionHeading string) ([]Task, error) {
+// ParseFile reads a daily note and extracts tasks within the given sections.
+// If sectionHeadings is empty, all tasks in the file are returned.
+func ParseFile(filePath string, noteDate time.Time, sectionHeadings []string) ([]Task, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var tasks []Task
-	scanner := bufio.NewScanner(f)
-	lineNum := 0
-	inSection := sectionHeading == ""
+	// Build a set of headings to match and determine the common heading level
+	headingSet := make(map[string]bool, len(sectionHeadings))
 	sectionLevel := ""
-	if sectionHeading != "" {
-		for _, ch := range sectionHeading {
-			if ch == '#' {
-				sectionLevel += "#"
-			} else {
-				break
+	for _, h := range sectionHeadings {
+		headingSet[h] = true
+		if sectionLevel == "" {
+			for _, ch := range h {
+				if ch == '#' {
+					sectionLevel += "#"
+				} else {
+					break
+				}
 			}
 		}
 	}
+
+	noFilter := len(sectionHeadings) == 0
+
+	var tasks []Task
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	inSection := noFilter
 
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
-		if sectionHeading != "" {
-			if trimmed == sectionHeading {
+		if !noFilter {
+			if headingSet[trimmed] {
 				inSection = true
 				continue
 			}
+			// Exit section when hitting another heading at the same level
 			if inSection && strings.HasPrefix(trimmed, sectionLevel+" ") && !strings.HasPrefix(trimmed, sectionLevel+"#") {
 				inSection = false
 				continue
@@ -192,9 +205,168 @@ func ParseFile(filePath string, noteDate time.Time, sectionHeading string) ([]Ta
 	return tasks, scanner.Err()
 }
 
+type cachedDailyNote struct {
+	modTime time.Time
+	size    int64
+	tasks   []Task
+}
+
+type DailyNotesCache struct {
+	cfg   Config
+	files map[string]cachedDailyNote
+}
+
+func NewDailyNotesCache(cfg Config) (*DailyNotesCache, []Task, error) {
+	cache := &DailyNotesCache{
+		cfg:   cfg,
+		files: make(map[string]cachedDailyNote),
+	}
+	tasks, err := cache.ReloadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	return cache, tasks, nil
+}
+
+func dailyNotePath(cfg Config, date time.Time) string {
+	dir := filepath.Join(cfg.Vault.Path, cfg.Vault.DailyNotesDir)
+	filename := date.Format(cfg.Vault.DailyNoteFormat) + ".md"
+	return filepath.Join(dir, filename)
+}
+
+func dailyNotesRange(cfg Config, now time.Time) map[string]time.Time {
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	start := today.AddDate(0, 0, -cfg.Tasks.LogbookDays)
+	end := today.AddDate(0, 0, cfg.Tasks.LookaheadDays)
+
+	paths := make(map[string]time.Time)
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		paths[dailyNotePath(cfg, d)] = d
+	}
+	return paths
+}
+
+func shouldExcludeTask(cfg Config, task Task) bool {
+	for _, tag := range task.Tags {
+		for _, ex := range cfg.Tasks.ExcludeTags {
+			if tag == ex || strings.HasPrefix(tag, ex+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *DailyNotesCache) ReloadAll() ([]Task, error) {
+	relevant := dailyNotesRange(c.cfg, time.Now())
+	for path, noteDate := range relevant {
+		if err := c.refreshFile(path, noteDate); err != nil {
+			return nil, err
+		}
+	}
+
+	for path := range c.files {
+		if _, ok := relevant[path]; !ok {
+			delete(c.files, path)
+		}
+	}
+
+	return c.collectTasks(relevant), nil
+}
+
+func (c *DailyNotesCache) ReloadPaths(paths []string) ([]Task, error) {
+	if len(paths) == 0 {
+		return c.ReloadAll()
+	}
+
+	relevant := dailyNotesRange(c.cfg, time.Now())
+	for path := range c.files {
+		if _, ok := relevant[path]; !ok {
+			delete(c.files, path)
+		}
+	}
+	for path, noteDate := range relevant {
+		if _, ok := c.files[path]; ok {
+			continue
+		}
+		if err := c.refreshFile(path, noteDate); err != nil {
+			return nil, err
+		}
+	}
+
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+
+		noteDate, ok := relevant[path]
+		if !ok {
+			delete(c.files, path)
+			continue
+		}
+		if err := c.refreshFile(path, noteDate); err != nil {
+			return nil, err
+		}
+	}
+
+	return c.collectTasks(relevant), nil
+}
+
+func (c *DailyNotesCache) refreshFile(path string, noteDate time.Time) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			delete(c.files, path)
+			return nil
+		}
+		return err
+	}
+
+	if cached, ok := c.files[path]; ok && cached.size == info.Size() && cached.modTime.Equal(info.ModTime()) {
+		return nil
+	}
+
+	tasks, err := ParseFile(path, noteDate, c.cfg.Tasks.EffectiveSectionHeadings())
+	if err != nil {
+		return nil
+	}
+
+	filtered := tasks[:0]
+	for _, task := range tasks {
+		if shouldExcludeTask(c.cfg, task) {
+			continue
+		}
+		filtered = append(filtered, task)
+	}
+
+	c.files[path] = cachedDailyNote{
+		modTime: info.ModTime(),
+		size:    info.Size(),
+		tasks:   append([]Task(nil), filtered...),
+	}
+	return nil
+}
+
+func (c *DailyNotesCache) collectTasks(relevant map[string]time.Time) []Task {
+	paths := make([]string, 0, len(relevant))
+	for path := range relevant {
+		if _, ok := c.files[path]; ok {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+
+	var allTasks []Task
+	for _, path := range paths {
+		allTasks = append(allTasks, c.files[path].tasks...)
+	}
+	return allTasks
+}
+
 // ScanDailyNotes scans the daily notes directory for tasks within the configured date range.
 func ScanDailyNotes(cfg Config) ([]Task, error) {
-	dir := filepath.Join(cfg.Vault.Path, cfg.Vault.DailyNotesDir)
 	now := time.Now()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	start := today.AddDate(0, 0, -cfg.Tasks.LogbookDays)
@@ -203,29 +375,16 @@ func ScanDailyNotes(cfg Config) ([]Task, error) {
 	var allTasks []Task
 
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
-		filename := d.Format(cfg.Vault.DailyNoteFormat) + ".md"
-		fp := filepath.Join(dir, filename)
+		fp := dailyNotePath(cfg, d)
 		if _, err := os.Stat(fp); err != nil {
 			continue
 		}
-		tasks, err := ParseFile(fp, d, cfg.Tasks.SectionHeading)
+		tasks, err := ParseFile(fp, d, cfg.Tasks.EffectiveSectionHeadings())
 		if err != nil {
 			continue
 		}
 		for _, t := range tasks {
-			excluded := false
-			for _, tag := range t.Tags {
-				for _, ex := range cfg.Tasks.ExcludeTags {
-					if tag == ex || strings.HasPrefix(tag, ex+"/") {
-						excluded = true
-						break
-					}
-				}
-				if excluded {
-					break
-				}
-			}
-			if !excluded {
+			if !shouldExcludeTask(cfg, t) {
 				allTasks = append(allTasks, t)
 			}
 		}
@@ -247,22 +406,25 @@ func ToggleDone(task *Task) error {
 	line := lines[idx]
 	if task.IsCompleted() {
 		// Reopen: [x]/[-] → [ ], remove completion markers
-		line = strings.Replace(line, "[x]", "[ ]", 1)
-		line = strings.Replace(line, "[X]", "[ ]", 1)
-		line = strings.Replace(line, "[-]", "[ ]", 1)
+		line = replaceTaskStatus(line, " ")
 		line = doneDateRe.ReplaceAllString(line, "")
 		line = cancelledDateRe.ReplaceAllString(line, "")
 		line = strings.TrimRight(line, " ")
+		task.Blocked = false
 		task.Done = false
 		task.Cancelled = false
 		task.CompletionDate = time.Time{}
 		task.CancelledDate = time.Time{}
 	} else {
-		// Done: [ ] → [x], append ✅ date
-		line = strings.Replace(line, "[ ]", "[x]", 1)
+		// Done: [ ]/[b] → [x], append ✅ date
+		line = replaceTaskStatus(line, "x")
+		line = doneDateRe.ReplaceAllString(line, "")
+		line = cancelledDateRe.ReplaceAllString(line, "")
 		now := time.Now()
 		todayLocal := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		line = strings.TrimRight(line, " ")
 		line = line + " ✅ " + todayLocal.Format("2006-01-02")
+		task.Blocked = false
 		task.Done = true
 		task.Cancelled = false
 		task.CompletionDate = todayLocal
@@ -284,10 +446,7 @@ func CancelTask(task *Task) error {
 		return err
 	}
 
-	line := lines[idx]
-	line = strings.Replace(line, "[ ]", "[-]", 1)
-	line = strings.Replace(line, "[x]", "[-]", 1)
-	line = strings.Replace(line, "[X]", "[-]", 1)
+	line := replaceTaskStatus(lines[idx], "-")
 	line = doneDateRe.ReplaceAllString(line, "")
 	line = cancelledDateRe.ReplaceAllString(line, "")
 	now := time.Now()
@@ -296,6 +455,7 @@ func CancelTask(task *Task) error {
 	line = line + " ❌ " + todayLocal.Format("2006-01-02")
 
 	lines[idx] = line
+	task.Blocked = false
 	task.Done = false
 	task.Cancelled = true
 	task.CompletionDate = time.Time{}
@@ -304,12 +464,45 @@ func CancelTask(task *Task) error {
 	return writeLines(task.FilePath, lines)
 }
 
-func buildTaskLine(description string, tags []string, priority int, dueDate time.Time, done bool, cancelled bool, completionDate time.Time, cancelledDate time.Time) string {
+func ToggleBlocked(task *Task) error {
+	lines, err := readLines(task.FilePath)
+	if err != nil {
+		return err
+	}
+	idx := task.LineNumber - 1
+	if err := verifyLine(lines, idx, task.RawLine); err != nil {
+		return err
+	}
+
+	line := lines[idx]
+	if task.Blocked {
+		line = replaceTaskStatus(line, " ")
+		task.Blocked = false
+	} else {
+		line = replaceTaskStatus(line, "b")
+		line = doneDateRe.ReplaceAllString(line, "")
+		line = cancelledDateRe.ReplaceAllString(line, "")
+		line = strings.TrimRight(line, " ")
+		task.Blocked = true
+		task.Done = false
+		task.Cancelled = false
+		task.CompletionDate = time.Time{}
+		task.CancelledDate = time.Time{}
+	}
+
+	lines[idx] = line
+	task.RawLine = line
+	return writeLines(task.FilePath, lines)
+}
+
+func buildTaskLine(description string, tags []string, priority int, dueDate time.Time, done bool, cancelled bool, blocked bool, completionDate time.Time, cancelledDate time.Time) string {
 	status := "[ ]"
 	if done {
 		status = "[x]"
 	} else if cancelled {
 		status = "[-]"
+	} else if blocked {
+		status = "[b]"
 	}
 
 	var b strings.Builder
@@ -355,8 +548,10 @@ func appendTaskLine(cfg Config, dueDate time.Time, taskLine string) error {
 		return err
 	}
 
-	filename := dueDate.Format(cfg.Vault.DailyNoteFormat) + ".md"
-	fp := filepath.Join(dir, filename)
+	// Use the first effective heading for task creation
+	heading := cfg.Tasks.EffectiveSectionHeadings()[0]
+
+	fp := dailyNotePath(cfg, dueDate)
 
 	// If file doesn't exist, create with template
 	if _, err := os.Stat(fp); os.IsNotExist(err) {
@@ -369,31 +564,36 @@ created: %s
 %s
 
 ---
-`, dueDate.Format("2006-01-02"), cfg.Tasks.SectionHeading, taskLine)
+`, dueDate.Format("2006-01-02"), heading, taskLine)
 		return os.WriteFile(fp, []byte(content), 0644)
 	}
 
-	// File exists — insert under section heading
+	// File exists — insert under first matching section heading
 	lines, err := readLines(fp)
 	if err != nil {
 		return err
 	}
 
 	insertIdx := -1
-	for i, l := range lines {
-		if strings.TrimSpace(l) == cfg.Tasks.SectionHeading {
-			insertIdx = i + 1
-			// Skip blank lines after heading
-			for insertIdx < len(lines) && strings.TrimSpace(lines[insertIdx]) == "" {
-				insertIdx++
+	for _, h := range cfg.Tasks.EffectiveSectionHeadings() {
+		for i, l := range lines {
+			if strings.TrimSpace(l) == h {
+				insertIdx = i + 1
+				// Skip blank lines after heading
+				for insertIdx < len(lines) && strings.TrimSpace(lines[insertIdx]) == "" {
+					insertIdx++
+				}
+				break
 			}
+		}
+		if insertIdx >= 0 {
 			break
 		}
 	}
 
 	if insertIdx == -1 {
-		// Heading not found, append at end
-		lines = append(lines, "", cfg.Tasks.SectionHeading, "", taskLine)
+		// No heading found, append with first heading
+		lines = append(lines, "", heading, "", taskLine)
 	} else {
 		// Insert at position
 		lines = append(lines[:insertIdx], append([]string{taskLine}, lines[insertIdx:]...)...)
@@ -404,7 +604,7 @@ created: %s
 
 // CreateTask appends a new task to the appropriate daily note file.
 func CreateTask(cfg Config, description string, dueDate time.Time, priority int) error {
-	taskLine := buildTaskLine(description, nil, priority, dueDate, false, false, time.Time{}, time.Time{})
+	taskLine := buildTaskLine(description, nil, priority, dueDate, false, false, false, time.Time{}, time.Time{})
 	return appendTaskLine(cfg, dueDate, taskLine)
 }
 
@@ -418,7 +618,7 @@ func CreateFollowUpTask(cfg Config, task Task) (time.Time, error) {
 		description = "Follow up: " + description
 	}
 
-	taskLine := buildTaskLine(description, task.Tags, task.Priority, followUpDate, false, false, time.Time{}, time.Time{})
+	taskLine := buildTaskLine(description, task.Tags, task.Priority, followUpDate, false, false, false, time.Time{}, time.Time{})
 	if err := appendTaskLine(cfg, followUpDate, taskLine); err != nil {
 		return time.Time{}, err
 	}
@@ -537,4 +737,12 @@ func verifyLine(lines []string, idx int, rawLine string) error {
 		return fmt.Errorf("file changed externally, please reload (r)")
 	}
 	return nil
+}
+
+func replaceTaskStatus(line string, statusSymbol string) string {
+	m := taskRe.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	return fmt.Sprintf("%s- [%s] %s", m[1], statusSymbol, m[3])
 }

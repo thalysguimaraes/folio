@@ -31,13 +31,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	tasks, err := ScanDailyNotes(cfg)
+	cache, tasks, err := NewDailyNotesCache(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error scanning tasks: %v\n", err)
 		os.Exit(1)
 	}
 
-	model := NewModel(cfg, tasks)
+	model := NewModel(cfg, cache, tasks)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

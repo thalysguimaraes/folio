@@ -28,7 +28,7 @@ A terminal UI for managing [Obsidian Tasks](https://publish.obsidian.md/tasks/In
 - **Obsidian Tasks compatible** — reads `- [ ]` / `- [x]` syntax with `📅` due dates and `✅` completion dates
 - **Section-scoped parsing** — only reads tasks from your configured section heading (e.g. `## Open Space`)
 - **Tag filtering** — mirrors Obsidian Tasks queries: requires tags, excludes `#habit` by default
-- **Create, edit, cancel, toggle** — changes are written back to the daily note files
+- **Create, edit, block, cancel, toggle** — changes are written back to the daily note files
 - **Follow-up shortcut** — press `f` on a task to create `Follow up: ...` in tomorrow's daily note before closing the current one
 - **Auto-sync** — watches the daily notes folder and reloads when markdown files change externally
 - **Tag-based colors** — consistent color per tag across the UI
@@ -86,6 +86,7 @@ The only required field is `vault.path`. Everything else has sensible defaults.
 | `n` | New task |
 | `e` | Edit task |
 | `d` | Toggle done / reopen |
+| `b` | Toggle blocked |
 | `f` | Create follow-up for tomorrow |
 | `t` | Toggle priority separators |
 | `D` | Cancel task |
@@ -101,6 +102,7 @@ Tasks follow the [Obsidian Tasks](https://publish.obsidian.md/tasks/Introduction
 
 ```markdown
 - [ ] Task description #tag 📅 2026-03-01
+- [b] Blocked task #tag 📅 2026-03-01
 - [x] Completed task #tag 📅 2026-02-28 ✅ 2026-02-28
 - [-] Cancelled task #tag 📅 2026-02-28 ❌ 2026-02-28
 ```
@@ -110,6 +112,8 @@ New tasks created via the TUI are written into the daily note file under the con
 Follow-ups use the same write path, preserving the current task's tags and priority, and schedule the new task for the next local day.
 
 Cancelling a task keeps it in the markdown file using the Obsidian Tasks cancelled status, so it drops out of the active lists but remains queryable in past notes and the logbook.
+
+Blocked tasks are stored as the custom checkbox status `[b]`. The TUI treats them as active tasks with distinct styling. If you want Obsidian Tasks queries to understand them semantically too, add a custom status for `b` in Obsidian Tasks settings and map it to an `ON_HOLD`-style status.
 
 ## Built with
 

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,6 +46,7 @@ type Model struct {
 	cfg      Config
 	allTasks []Task
 	watcher  *dailyNotesWatcher
+	cache    *DailyNotesCache
 
 	activeView    int
 	focus         int
@@ -82,7 +84,7 @@ func tagColor(tag string) lipgloss.Color {
 	return lipgloss.Color(colors[h.Sum32()%uint32(len(colors))])
 }
 
-func NewModel(cfg Config, tasks []Task) Model {
+func NewModel(cfg Config, cache *DailyNotesCache, tasks []Task) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Task description #tag p1-p5"
 	ti.CharLimit = 256
@@ -90,6 +92,7 @@ func NewModel(cfg Config, tasks []Task) Model {
 
 	m := Model{
 		cfg:                    cfg,
+		cache:                  cache,
 		allTasks:               tasks,
 		mode:                   modeNormal,
 		input:                  ti,
@@ -191,43 +194,40 @@ func (m *Model) buildViews() {
 	}
 
 	sortByTodayPriority := func(indices []int) {
-		for i := 0; i < len(indices); i++ {
-			for j := i + 1; j < len(indices); j++ {
-				ti := m.allTasks[indices[i]]
-				tj := m.allTasks[indices[j]]
-				tiDue := dueDateAtLocation(ti.DueDate, today.Location())
-				tjDue := dueDateAtLocation(tj.DueDate, today.Location())
-				if tj.Priority < ti.Priority {
-					indices[i], indices[j] = indices[j], indices[i]
-					continue
-				}
-				if tj.Priority > ti.Priority {
-					continue
-				}
+		sort.SliceStable(indices, func(i, j int) bool {
+			ti := m.allTasks[indices[i]]
+			tj := m.allTasks[indices[j]]
+			tiDue := dueDateAtLocation(ti.DueDate, today.Location())
+			tjDue := dueDateAtLocation(tj.DueDate, today.Location())
 
-				iOverdue := isTaskOverdue(ti, today)
-				jOverdue := isTaskOverdue(tj, today)
-				if jOverdue && !iOverdue {
-					indices[i], indices[j] = indices[j], indices[i]
-					continue
-				}
-				if jOverdue == iOverdue {
-					if tjDue.Before(tiDue) {
-						indices[i], indices[j] = indices[j], indices[i]
-					}
-				}
+			if ti.Priority != tj.Priority {
+				return ti.Priority < tj.Priority
 			}
-		}
+
+			iOverdue := isTaskOverdue(ti, today)
+			jOverdue := isTaskOverdue(tj, today)
+			if iOverdue != jOverdue {
+				return iOverdue
+			}
+
+			if !tiDue.Equal(tjDue) {
+				return tiDue.Before(tjDue)
+			}
+			return ti.Description < tj.Description
+		})
 	}
 	sortByPriority := func(indices []int) {
-		for i := 0; i < len(indices); i++ {
-			for j := i + 1; j < len(indices); j++ {
-				ti, tj := m.allTasks[indices[i]], m.allTasks[indices[j]]
-				if tj.DueDate.Before(ti.DueDate) || (tj.DueDate.Equal(ti.DueDate) && tj.Priority < ti.Priority) {
-					indices[i], indices[j] = indices[j], indices[i]
-				}
+		sort.SliceStable(indices, func(i, j int) bool {
+			ti := m.allTasks[indices[i]]
+			tj := m.allTasks[indices[j]]
+			if !ti.DueDate.Equal(tj.DueDate) {
+				return ti.DueDate.Before(tj.DueDate)
 			}
-		}
+			if ti.Priority != tj.Priority {
+				return ti.Priority < tj.Priority
+			}
+			return ti.Description < tj.Description
+		})
 	}
 	m.todayTasks = append(m.todayTasks, todayUndone...)
 	m.todayTasks = append(m.todayTasks, overdueUndone...)
@@ -237,13 +237,7 @@ func (m *Model) buildViews() {
 	for key := range upcomingMap {
 		upcomingSorted = append(upcomingSorted, key)
 	}
-	for i := 0; i < len(upcomingSorted); i++ {
-		for j := i + 1; j < len(upcomingSorted); j++ {
-			if upcomingSorted[j] < upcomingSorted[i] {
-				upcomingSorted[i], upcomingSorted[j] = upcomingSorted[j], upcomingSorted[i]
-			}
-		}
-	}
+	sort.Strings(upcomingSorted)
 	for _, key := range upcomingSorted {
 		tasks := upcomingMap[key]
 		sortByPriority(tasks)
@@ -258,13 +252,9 @@ func (m *Model) buildViews() {
 	for key := range logbookMap {
 		logbookSorted = append(logbookSorted, key)
 	}
-	for i := 0; i < len(logbookSorted); i++ {
-		for j := i + 1; j < len(logbookSorted); j++ {
-			if logbookSorted[j] > logbookSorted[i] {
-				logbookSorted[i], logbookSorted[j] = logbookSorted[j], logbookSorted[i]
-			}
-		}
-	}
+	sort.Slice(logbookSorted, func(i, j int) bool {
+		return logbookSorted[i] > logbookSorted[j]
+	})
 	for _, key := range logbookSorted {
 		m.logbookGroups = append(m.logbookGroups, DateGroup{
 			Date:  logbookDates[key],
@@ -356,7 +346,19 @@ func (m Model) selectedTask() *Task {
 }
 
 func (m Model) reload() Model {
-	tasks, err := ScanDailyNotes(m.cfg)
+	return m.reloadPaths(nil)
+}
+
+func (m Model) reloadPaths(paths []string) Model {
+	var (
+		tasks []Task
+		err   error
+	)
+	if m.cache != nil {
+		tasks, err = m.cache.ReloadPaths(paths)
+	} else {
+		tasks, err = ScanDailyNotes(m.cfg)
+	}
 	if err != nil {
 		m.err = err
 		m.statusMsg = "Reload error: " + err.Error()
@@ -367,6 +369,31 @@ func (m Model) reload() Model {
 	m.selected = make(map[int]bool)
 	m.buildViews()
 	return m
+}
+
+func (m Model) reloadTask(task *Task) Model {
+	if task == nil {
+		return m.reload()
+	}
+	return m.reloadPaths([]string{task.FilePath})
+}
+
+func (m Model) reloadTaskIndices(indices map[int]bool) Model {
+	if len(indices) == 0 {
+		return m.reload()
+	}
+
+	paths := make([]string, 0, len(indices))
+	seen := make(map[string]struct{}, len(indices))
+	for idx := range indices {
+		path := m.allTasks[idx].FilePath
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return m.reloadPaths(paths)
 }
 
 func (m Model) nextWatchCmd() tea.Cmd {
@@ -401,7 +428,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusTime = time.Now()
 			return m, cmd
 		}
-		m = m.reload()
+		m = m.reloadPaths(msg.paths)
 		if m.err == nil {
 			if !m.preserveStatusUntil.IsZero() && msg.at.Before(m.preserveStatusUntil) {
 				return m, cmd
@@ -441,7 +468,7 @@ func (m Model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "Error: " + err.Error()
 			} else {
 				m.markInternalWrite("Task cancelled")
-				m = m.reload()
+				m = m.reloadTask(task)
 			}
 		}
 		m.mode = modeNormal
@@ -477,7 +504,7 @@ func (m Model) handlePriority(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "Error: " + err.Error()
 			} else {
 				m.markInternalWrite("Priority → " + labels[p])
-				m = m.reload()
+				m = m.reloadTask(task)
 			}
 		}
 		m.mode = modeNormal
@@ -535,13 +562,13 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if task == nil {
 				return m, nil
 			}
-			newLine := buildTaskLine(value, task.Tags, task.Priority, task.DueDate, task.Done, task.Cancelled, task.CompletionDate, task.CancelledDate)
+			newLine := buildTaskLine(value, task.Tags, task.Priority, task.DueDate, task.Done, task.Cancelled, task.Blocked, task.CompletionDate, task.CancelledDate)
 			if err := UpdateTaskLine(task, newLine); err != nil {
 				m.err = err
 				m.statusMsg = "Error: " + err.Error()
 			} else {
 				m.markInternalWrite("Task updated")
-				m = m.reload()
+				m = m.reloadTask(task)
 			}
 
 		case modeFilter:
@@ -562,6 +589,7 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if len(m.selected) > 0 {
 				count := 0
+				selected := m.selected
 				for idx := range m.selected {
 					if err := RescheduleTask(&m.allTasks[idx], newDate); err != nil {
 						m.statusMsg = "Error: " + err.Error()
@@ -572,7 +600,7 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.selected = make(map[int]bool)
 				m.markInternalWrite(fmt.Sprintf("%d tasks → %s", count, newDate.Format("Jan 02")))
-				m = m.reload()
+				m = m.reloadTaskIndices(selected)
 			} else {
 				task := m.selectedTask()
 				if task == nil {
@@ -583,7 +611,7 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.statusMsg = "Error: " + err.Error()
 				} else {
 					m.markInternalWrite("Rescheduled → " + newDate.Format("Jan 02"))
-					m = m.reload()
+					m = m.reloadTask(task)
 				}
 			}
 		}
@@ -704,7 +732,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					} else {
 						m.markInternalWrite("Marked undone")
 					}
-					m = m.reload()
+					m = m.reloadTask(task)
 				}
 			}
 		}
@@ -749,9 +777,10 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					count++
 				}
+				selected := m.selected
 				m.selected = make(map[int]bool)
 				m.markInternalWrite(fmt.Sprintf("%d tasks marked done", count))
-				m = m.reload()
+				m = m.reloadTaskIndices(selected)
 			} else {
 				task := m.selectedTask()
 				if task != nil {
@@ -767,7 +796,57 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						} else {
 							m.markInternalWrite("Marked undone")
 						}
-						m = m.reload()
+						m = m.reloadTask(task)
+					}
+				}
+			}
+		}
+
+	case "b":
+		if m.focus == focusContent && m.activeView != viewLogbook {
+			if len(m.selected) > 0 {
+				targetBlocked := false
+				for idx := range m.selected {
+					if !m.allTasks[idx].Blocked {
+						targetBlocked = true
+						break
+					}
+				}
+
+				count := 0
+				selected := m.selected
+				for idx := range m.selected {
+					if m.allTasks[idx].Blocked == targetBlocked {
+						continue
+					}
+					if err := ToggleBlocked(&m.allTasks[idx]); err != nil {
+						m.statusMsg = "Error: " + err.Error()
+						m.statusTime = time.Now()
+						break
+					}
+					count++
+				}
+				m.selected = make(map[int]bool)
+				if targetBlocked {
+					m.markInternalWrite(fmt.Sprintf("%d tasks blocked", count))
+				} else {
+					m.markInternalWrite(fmt.Sprintf("%d tasks unblocked", count))
+				}
+				m = m.reloadTaskIndices(selected)
+			} else {
+				task := m.selectedTask()
+				if task != nil {
+					targetBlocked := !task.Blocked
+					if err := ToggleBlocked(task); err != nil {
+						m.err = err
+						m.statusMsg = "Error: " + err.Error()
+					} else {
+						if targetBlocked {
+							m.markInternalWrite("Marked blocked")
+						} else {
+							m.markInternalWrite("Marked unblocked")
+						}
+						m = m.reloadTask(task)
 					}
 				}
 			}
@@ -783,7 +862,7 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.statusMsg = "Error: " + err.Error()
 				} else {
 					m.markInternalWrite("Follow-up → " + followUpDate.Format("Jan 02"))
-					m = m.reload()
+					m = m.reloadPaths([]string{dailyNotePath(m.cfg, followUpDate)})
 				}
 			}
 		}
@@ -1076,11 +1155,7 @@ func (m Model) renderTodayRows(maxWidth int) ([]string, int) {
 	isActive := m.focus == focusContent
 
 	if len(m.todayTasks) == 0 {
-		emptyStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color(m.cfg.Theme.Muted)).
-			Italic(true).
-			PaddingLeft(2)
-		rows = append(rows, emptyStyle.Render("No tasks for today"))
+		rows = append(rows, m.renderTodayEmptyState(maxWidth)...)
 		return rows, selectedLine
 	}
 
@@ -1102,6 +1177,58 @@ func (m Model) renderTodayRows(maxWidth int) ([]string, int) {
 	}
 
 	return rows, selectedLine
+}
+
+func (m Model) renderTodayEmptyState(maxWidth int) []string {
+	width := max(24, maxWidth-6)
+	accent := lipgloss.Color(m.cfg.Theme.Accent)
+	muted := lipgloss.Color(m.cfg.Theme.Muted)
+	done := lipgloss.Color(m.cfg.Theme.Done)
+
+	artStyle := lipgloss.NewStyle().
+		Foreground(accent).
+		Bold(true)
+	kickerStyle := lipgloss.NewStyle().
+		Foreground(done).
+		Bold(true)
+	titleStyle := lipgloss.NewStyle().
+		Foreground(accent).
+		Bold(true)
+	subtitleStyle := lipgloss.NewStyle().
+		Foreground(muted)
+
+	cardStyle := lipgloss.NewStyle().
+		Border(subtleBorder).
+		BorderForeground(done).
+		Padding(1, 3).
+		Width(width)
+
+	art := []string{
+		" (')) ^v^  _           (`)_",
+		"(__)_) ,--j j-------, (__)_)",
+		"      /_.-.___.-.__/ \\",
+		"    ,8| [_],-.[_] | oOo",
+		",,,oO8|_o8_|_|_8o_|&888o,,,hjw",
+	}
+
+	content := []string{
+		kickerStyle.Render("Day complete"),
+		"",
+		titleStyle.Render("All clear"),
+		subtitleStyle.Render("Your list is quiet, sorted, and out of the way."),
+		subtitleStyle.Render("Close the loop or enjoy the empty space."),
+	}
+
+	var body []string
+	for _, line := range art {
+		body = append(body, lipgloss.PlaceHorizontal(width, lipgloss.Center, artStyle.Render(line)))
+	}
+	body = append(body, "")
+	for _, line := range content {
+		body = append(body, lipgloss.PlaceHorizontal(width, lipgloss.Center, line))
+	}
+
+	return strings.Split(cardStyle.Render(strings.Join(body, "\n")), "\n")
 }
 
 func (m Model) renderUpcomingView(maxWidth, maxHeight int) string {
@@ -1347,6 +1474,9 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 	} else if task.Cancelled {
 		bullet = "✕"
 		bulletColor = lipgloss.Color(m.cfg.Theme.Overdue)
+	} else if task.Blocked {
+		bullet = "◆"
+		bulletColor = lipgloss.Color("#d28b26")
 	}
 	if isOverdue {
 		bulletColor = lipgloss.Color(m.cfg.Theme.Overdue)
@@ -1362,6 +1492,9 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 
 	desc := task.Description
 	descMaxWidth := maxWidth - 8
+	if task.Blocked {
+		descMaxWidth -= 10
+	}
 	if descMaxWidth < 10 {
 		descMaxWidth = 10
 	}
@@ -1377,6 +1510,11 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 	}
 	if task.Cancelled {
 		descStyle = descStyle.Foreground(lipgloss.Color(m.cfg.Theme.Overdue))
+	}
+	if task.Blocked {
+		descStyle = descStyle.
+			Foreground(lipgloss.Color("#d28b26")).
+			Italic(true)
 	}
 	if isOverdue {
 		descStyle = descStyle.Foreground(lipgloss.Color(m.cfg.Theme.Overdue))
@@ -1394,9 +1532,20 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 		priorityStr = " " + emoji
 	}
 
+	stateStr := ""
+	if task.Blocked {
+		stateStr = " " + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#d28b26")).
+			Bold(true).
+			Render("blocked")
+	}
+
 	line := prefix + bulletStyle.Render(bullet) + descStyle.Render(desc)
 	if priorityStr != "" {
 		line += priorityStr
+	}
+	if stateStr != "" {
+		line += stateStr
 	}
 	if tagStr != "" {
 		line += " " + tagStr
@@ -1477,7 +1626,7 @@ func (m Model) renderFooter(width int) string {
 
 	var keys string
 	if len(m.selected) > 0 {
-		keys = fmt.Sprintf("(%d selected) d done  s reschedule  v toggle all  esc clear  ? help  q quit", len(m.selected))
+		keys = fmt.Sprintf("(%d selected) d done  b blocked  s reschedule  v toggle all  esc clear  ? help  q quit", len(m.selected))
 	} else if m.activeView == viewLogbook {
 		keys = "←/→ prev/next day  d reopen  / filter  ? help  q quit"
 	} else {
@@ -1485,7 +1634,7 @@ func (m Model) renderFooter(width int) string {
 		if m.showPrioritySeparators {
 			toggleState = "on"
 		}
-		keys = fmt.Sprintf("n new  d done  f follow-up  s reschedule  p priority  e edit  D cancel  t separators(%s)  space select  v all  / filter  ? help", toggleState)
+		keys = fmt.Sprintf("n new  d done  b blocked  f follow-up  s reschedule  p priority  e edit  D cancel  t separators(%s)  space select  v all  / filter  ? help", toggleState)
 	}
 
 	keyStyle := lipgloss.NewStyle().
@@ -1518,6 +1667,7 @@ func (m Model) renderHelp() string {
     n               New task
     e               Edit task
     d               Toggle done/reopen
+    b               Toggle blocked
     f               Create follow-up for tomorrow
     s               Reschedule task
     p               Set priority
@@ -1534,6 +1684,7 @@ func (m Model) renderHelp() string {
     Space           Toggle select
     v               Select/deselect all
     d               Mark selected done
+    b               Toggle selected blocked
     s               Reschedule selected
     Esc             Clear selection
 

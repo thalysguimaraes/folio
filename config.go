@@ -20,10 +20,23 @@ type VaultConfig struct {
 }
 
 type TasksConfig struct {
-	SectionHeading string   `toml:"section_heading"`
-	LogbookDays    int      `toml:"logbook_days"`
-	LookaheadDays  int      `toml:"lookahead_days"`
-	ExcludeTags    []string `toml:"exclude_tags"`
+	SectionHeading  string   `toml:"section_heading"`
+	SectionHeadings []string `toml:"section_headings"`
+	LogbookDays     int      `toml:"logbook_days"`
+	LookaheadDays   int      `toml:"lookahead_days"`
+	ExcludeTags     []string `toml:"exclude_tags"`
+}
+
+// EffectiveSectionHeadings returns the resolved list of section headings.
+// Prefers section_headings (plural); falls back to section_heading (singular).
+func (c TasksConfig) EffectiveSectionHeadings() []string {
+	if len(c.SectionHeadings) > 0 {
+		return c.SectionHeadings
+	}
+	if c.SectionHeading != "" {
+		return []string{c.SectionHeading}
+	}
+	return []string{"## :LiPencil: Open Space"}
 }
 
 type ThemeConfig struct {
@@ -43,10 +56,13 @@ func DefaultConfig() Config {
 			DailyNoteFormat: "2006-01-02",
 		},
 		Tasks: TasksConfig{
-			SectionHeading: "## :LiPencil: Open Space",
-			LogbookDays:    30,
-			LookaheadDays:  14,
-			ExcludeTags:    []string{"#habit"},
+			SectionHeadings: []string{
+				"## :LiPencil: Open Space",
+				"## :LiCheckCheck: Tasks",
+			},
+			LogbookDays:   30,
+			LookaheadDays: 14,
+			ExcludeTags:   []string{"#habit"},
 		},
 		Theme: ThemeConfig{
 			Accent:   "#7571F9",
