@@ -105,7 +105,7 @@ func parseNaturalDate(input string, reference time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognized date: %s", trimmed)
 }
 
-func parseTaskDraftInput(input string, defaultDueDate, reference time.Time) (taskDraft, error) {
+func parseTaskDraftInput(input string, defaultDueDate time.Time, defaultPriority int, reference time.Time) (taskDraft, error) {
 	value := strings.TrimSpace(input)
 	if value == "" {
 		return taskDraft{}, fmt.Errorf("empty task input")
@@ -113,13 +113,13 @@ func parseTaskDraftInput(input string, defaultDueDate, reference time.Time) (tas
 
 	draft := taskDraft{
 		DueDate:  normalizeDate(defaultDueDate, reference.Location()),
-		Priority: PriorityNone,
+		Priority: defaultPriority,
 	}
 
 	var foundPriority bool
 	value, draft.Priority, foundPriority = extractPriorityToken(value)
 	if !foundPriority {
-		draft.Priority = PriorityNone
+		draft.Priority = defaultPriority
 	}
 
 	description, dueDate, matchedDue, err := extractTrailingDueDate(value, draft.DueDate, reference)

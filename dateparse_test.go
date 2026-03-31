@@ -125,7 +125,7 @@ func TestParseTaskDraftInput(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			draft, err := parseTaskDraftInput(tc.input, defaultDueDate, ref)
+			draft, err := parseTaskDraftInput(tc.input, defaultDueDate, PriorityNone, ref)
 			if err != nil {
 				t.Fatalf("parseTaskDraftInput returned error: %v", err)
 			}
@@ -146,8 +146,34 @@ func TestParseTaskDraftInputRejectsInvalidExplicitDueDate(t *testing.T) {
 	ref := time.Date(2026, time.March, 27, 15, 30, 0, 0, time.Local)
 	defaultDueDate := time.Date(2026, time.April, 2, 0, 0, 0, 0, time.Local)
 
-	if _, err := parseTaskDraftInput("Ship release due: sometime", defaultDueDate, ref); err == nil {
+	if _, err := parseTaskDraftInput("Ship release due: sometime", defaultDueDate, PriorityNone, ref); err == nil {
 		t.Fatal("expected invalid explicit due date to fail")
+	}
+}
+
+func TestParseTaskDraftInputUsesInheritedPriorityWhenMissing(t *testing.T) {
+	ref := time.Date(2026, time.March, 27, 15, 30, 0, 0, time.Local)
+	defaultDueDate := time.Date(2026, time.April, 2, 0, 0, 0, 0, time.Local)
+
+	draft, err := parseTaskDraftInput("Ship release #work", defaultDueDate, PriorityMedium, ref)
+	if err != nil {
+		t.Fatalf("parseTaskDraftInput returned error: %v", err)
+	}
+	if draft.Priority != PriorityMedium {
+		t.Fatalf("expected inherited priority %d, got %d", PriorityMedium, draft.Priority)
+	}
+}
+
+func TestParseTaskDraftInputExplicitPriorityOverridesInheritedPriority(t *testing.T) {
+	ref := time.Date(2026, time.March, 27, 15, 30, 0, 0, time.Local)
+	defaultDueDate := time.Date(2026, time.April, 2, 0, 0, 0, 0, time.Local)
+
+	draft, err := parseTaskDraftInput("Ship release p1", defaultDueDate, PriorityLow, ref)
+	if err != nil {
+		t.Fatalf("parseTaskDraftInput returned error: %v", err)
+	}
+	if draft.Priority != PriorityHighest {
+		t.Fatalf("expected explicit priority %d, got %d", PriorityHighest, draft.Priority)
 	}
 }
 

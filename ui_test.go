@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 )
 
@@ -381,6 +383,80 @@ func TestRenderTodayViewOverdueUsesLocalDateNotTimezone(t *testing.T) {
 
 	if isTaskOverdue(task, today) {
 		t.Fatalf("expected UTC task dated today to be non-overdue in local-date comparison")
+	}
+}
+
+func TestHandleNormalModeNewTaskInheritsSelectedPriority(t *testing.T) {
+	today := localToday()
+	m := NewModel(DefaultConfig(), nil, []Task{{Description: "Priority task", Priority: PriorityMedium, DueDate: today}})
+	m.focus = focusContent
+
+	m.buildViews()
+
+	updated, _ := m.handleNormalMode(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	got := updated.(Model)
+
+	if got.mode != modeNewTask {
+		t.Fatalf("expected new task mode, got %d", got.mode)
+	}
+	if got.newTaskDefaultPriority != PriorityMedium {
+		t.Fatalf("expected inherited priority %d, got %d", PriorityMedium, got.newTaskDefaultPriority)
+	}
+}
+
+func TestHandleNormalModeDuplicatePrefillsTaskContent(t *testing.T) {
+	today := localToday()
+	m := NewModel(DefaultConfig(), nil, []Task{{
+		Description: "Ship release",
+		Tags:        []string{"#work", "#release"},
+		Priority:    PriorityHigh,
+		DueDate:     today,
+	}})
+	m.focus = focusContent
+
+	m.buildViews()
+
+	updated, _ := m.handleNormalMode(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	got := updated.(Model)
+
+	if got.mode != modeNewTask {
+		t.Fatalf("expected duplicate shortcut to open new task mode, got %d", got.mode)
+	}
+	if got.newTaskTitle != "Duplicate Task" {
+		t.Fatalf("expected duplicate task title, got %q", got.newTaskTitle)
+	}
+	if got.input.Value() != "Ship release #work #release" {
+		t.Fatalf("unexpected duplicate prefill: %q", got.input.Value())
+	}
+}
+
+func TestRenderTaskRowExpandsSelectedTaskInsteadOfTruncating(t *testing.T) {
+	task := Task{
+		Description: "alpha beta gamma delta epsilon zeta eta theta iota kappa omega",
+		Tags:        []string{"#project/personal/obsidian-tasks-tui", "#work"},
+		Priority:    PriorityMedium,
+		DueDate:     localToday(),
+	}
+	m := Model{cfg: DefaultConfig()}
+
+	collapsed := m.renderTaskRow(task, false, 32, false, false)
+	plainCollapsed := ansiRE.ReplaceAllString(collapsed, "")
+	plainExpanded := ansiRE.ReplaceAllString(m.renderTaskRow(task, true, 32, false, false), "")
+
+	if !strings.Contains(plainCollapsed, "...") {
+		t.Fatalf("expected collapsed row to be truncated, got %q", plainCollapsed)
+	}
+	if strings.Contains(collapsed, "\n") {
+		t.Fatalf("did not expect collapsed row to wrap, got %q", plainCollapsed)
+	}
+	if ansi.StringWidth(collapsed) > 32 {
+		t.Fatalf("expected collapsed row width <= 32, got %d: %q", ansi.StringWidth(collapsed), plainCollapsed)
+	}
+	if strings.Contains(plainExpanded, "...") {
+		t.Fatalf("did not expect selected row to be truncated, got %q", plainExpanded)
+	}
+	if !strings.Contains(plainExpanded, "omega") {
+		t.Fatalf("expected selected row to include the end of the description, got %q", plainExpanded)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const hPad = 2
@@ -34,6 +35,7 @@ const (
 	modeConfirmDelete
 	modeReschedule
 	modePriority
+	modeSnooze
 )
 
 type DateGroup struct {
@@ -42,11 +44,21 @@ type DateGroup struct {
 	Tasks []int
 }
 
+type snoozeExpiredMsg struct {
+	at time.Time
+}
+
+type rowSelection struct {
+	start int
+	end   int
+}
+
 type Model struct {
 	cfg      Config
 	allTasks []Task
 	watcher  *dailyNotesWatcher
 	cache    *DailyNotesCache
+	snoozes  *SnoozeStore
 
 	activeView    int
 	focus         int
@@ -72,6 +84,9 @@ type Model struct {
 	selected map[int]bool
 
 	showPrioritySeparators bool
+	newTaskTitle           string
+	newTaskDefaultDueDate  time.Time
+	newTaskDefaultPriority int
 }
 
 func tagColor(tag string) lipgloss.Color {
@@ -100,6 +115,7 @@ func NewModel(cfg Config, cache *DailyNotesCache, tasks []Task) Model {
 		focus:                  focusSidebar,
 		selected:               make(map[int]bool),
 		showPrioritySeparators: true,
+		newTaskDefaultPriority: PriorityNone,
 	}
 	watcher, err := newDailyNotesWatcher(cfg)
 	if err != nil {
@@ -107,6 +123,16 @@ func NewModel(cfg Config, cache *DailyNotesCache, tasks []Task) Model {
 		m.statusTime = time.Now()
 	} else {
 		m.watcher = watcher
+	}
+	store, err := NewSnoozeStore("")
+	if err != nil {
+		if m.statusMsg == "" {
+			m.statusMsg = "Snooze disabled: " + err.Error()
+			m.statusTime = time.Now()
+		}
+	} else {
+		m.snoozes = store
+		m.syncSnoozes()
 	}
 	m.buildViews()
 	return m
@@ -133,6 +159,41 @@ func localToday() time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 }
 
+func noRowSelection() rowSelection {
+	return rowSelection{start: -1, end: -1}
+}
+
+func (s rowSelection) hasSelection() bool {
+	return s.start >= 0 && s.end >= s.start
+}
+
+func shiftRowSelection(selection rowSelection, offset int) rowSelection {
+	if !selection.hasSelection() {
+		return selection
+	}
+	return rowSelection{
+		start: selection.start + offset,
+		end:   selection.end + offset,
+	}
+}
+
+func priorityDraftToken(priority int) string {
+	switch priority {
+	case PriorityHighest:
+		return "p1"
+	case PriorityHigh:
+		return "p2"
+	case PriorityMedium:
+		return "p3"
+	case PriorityLow:
+		return "p4"
+	case PriorityLowest:
+		return "p5"
+	default:
+		return ""
+	}
+}
+
 func dueDateAtLocation(dueDate time.Time, location *time.Location) time.Time {
 	return time.Date(dueDate.Year(), dueDate.Month(), dueDate.Day(), 0, 0, 0, 0, location)
 }
@@ -140,6 +201,99 @@ func dueDateAtLocation(dueDate time.Time, location *time.Location) time.Time {
 func isTaskOverdue(task Task, today time.Time) bool {
 	taskDate := dueDateAtLocation(task.DueDate, today.Location())
 	return taskDate.Before(today)
+}
+
+func (m Model) activeTaskKeys() map[string]struct{} {
+	keys := make(map[string]struct{})
+	for _, task := range m.allTasks {
+		if task.IsCompleted() {
+			continue
+		}
+		keys[taskSnoozeKey(task)] = struct{}{}
+	}
+	return keys
+}
+
+func (m *Model) syncSnoozes() {
+	if m.snoozes == nil {
+		return
+	}
+	if err := m.snoozes.Prune(m.activeTaskKeys(), time.Now()); err != nil {
+		m.err = err
+		m.statusMsg = "Snooze error: " + err.Error()
+		m.statusTime = time.Now()
+	}
+}
+
+func (m Model) isTaskSnoozed(task Task) bool {
+	if m.snoozes == nil || task.IsCompleted() {
+		return false
+	}
+	return m.snoozes.IsActive(taskSnoozeKey(task), time.Now())
+}
+
+func (m Model) taskCreationDueDate() time.Time {
+	defaultDueDate := localToday()
+	if m.activeView == viewUpcoming && len(m.upcomingGroups) > 0 {
+		groupIdx := m.groupIndexForCursor()
+		if groupIdx >= 0 && groupIdx < len(m.upcomingGroups) {
+			defaultDueDate = m.upcomingGroups[groupIdx].Date
+		}
+	}
+	return defaultDueDate
+}
+
+func (m Model) taskCreationPriority() int {
+	task := m.selectedTask()
+	if task == nil {
+		return PriorityNone
+	}
+	return task.Priority
+}
+
+func (m Model) duplicateTaskPrefill(task Task) string {
+	parts := []string{task.Description}
+	if len(task.Tags) > 0 {
+		parts = append(parts, strings.Join(task.Tags, " "))
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+func (m *Model) resetNewTaskContext() {
+	m.newTaskTitle = ""
+	m.newTaskDefaultDueDate = time.Time{}
+	m.newTaskDefaultPriority = PriorityNone
+}
+
+func (m *Model) openNewTaskModal(title, prefill string) tea.Cmd {
+	m.mode = modeNewTask
+	m.newTaskTitle = title
+	m.newTaskDefaultDueDate = m.taskCreationDueDate()
+	m.newTaskDefaultPriority = m.taskCreationPriority()
+	m.input.Placeholder = "Task description #tag p1-p5 📅 amanhã"
+	m.input.SetValue(prefill)
+	m.input.Focus()
+	return m.input.Cursor.BlinkCmd()
+}
+
+func (m Model) nextSnoozeCmd() tea.Cmd {
+	if m.snoozes == nil {
+		return nil
+	}
+
+	next, ok := m.snoozes.NextExpiration()
+	if !ok {
+		return nil
+	}
+
+	delay := time.Until(next)
+	if delay < 0 {
+		delay = 0
+	}
+
+	return tea.Tick(delay, func(t time.Time) tea.Msg {
+		return snoozeExpiredMsg{at: t}
+	})
 }
 
 func (m *Model) buildViews() {
@@ -163,6 +317,9 @@ func (m *Model) buildViews() {
 
 	for i, t := range m.allTasks {
 		if !m.matchesFilter(t) {
+			continue
+		}
+		if m.isTaskSnoozed(t) {
 			continue
 		}
 		due := time.Date(t.DueDate.Year(), t.DueDate.Month(), t.DueDate.Day(), 0, 0, 0, 0, today.Location())
@@ -367,6 +524,7 @@ func (m Model) reloadPaths(paths []string) Model {
 	m.err = nil
 	m.allTasks = tasks
 	m.selected = make(map[int]bool)
+	m.syncSnoozes()
 	m.buildViews()
 	return m
 }
@@ -410,7 +568,7 @@ func (m *Model) markInternalWrite(status string) {
 }
 
 func (m Model) Init() tea.Cmd {
-	return m.nextWatchCmd()
+	return tea.Batch(m.nextWatchCmd(), m.nextSnoozeCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -426,20 +584,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.statusMsg = "Auto-sync error: " + msg.err.Error()
 			m.statusTime = time.Now()
-			return m, cmd
+			return m, tea.Batch(cmd, m.nextSnoozeCmd())
 		}
 		m = m.reloadPaths(msg.paths)
 		if m.err == nil {
 			if !m.preserveStatusUntil.IsZero() && msg.at.Before(m.preserveStatusUntil) {
-				return m, cmd
+				return m, tea.Batch(cmd, m.nextSnoozeCmd())
 			}
 			m.statusMsg = "Synced from files"
 			m.statusTime = time.Now()
 		}
-		return m, cmd
+		return m, tea.Batch(cmd, m.nextSnoozeCmd())
+
+	case snoozeExpiredMsg:
+		m.syncSnoozes()
+		m.buildViews()
+		return m, m.nextSnoozeCmd()
 
 	case tea.KeyMsg:
-		if m.mode == modeNewTask || m.mode == modeEditTask || m.mode == modeFilter || m.mode == modeReschedule {
+		if m.mode == modeNewTask || m.mode == modeEditTask || m.mode == modeFilter || m.mode == modeReschedule || m.mode == modeSnooze {
 			return m.handleInputMode(msg)
 		}
 		if m.mode == modeHelp {
@@ -519,6 +682,7 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.mode = modeNormal
 		m.input.Blur()
+		m.resetNewTaskContext()
 		return m, nil
 
 	case "enter":
@@ -529,17 +693,16 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.mode {
 		case modeNewTask:
 			m.mode = modeNormal
+			defaultDueDate := m.newTaskDefaultDueDate
+			if defaultDueDate.IsZero() {
+				defaultDueDate = m.taskCreationDueDate()
+			}
+			defaultPriority := m.newTaskDefaultPriority
+			m.resetNewTaskContext()
 			if value == "" {
 				return m, nil
 			}
-			defaultDueDate := localToday()
-			if m.activeView == viewUpcoming && len(m.upcomingGroups) > 0 {
-				groupIdx := m.groupIndexForCursor()
-				if groupIdx >= 0 && groupIdx < len(m.upcomingGroups) {
-					defaultDueDate = m.upcomingGroups[groupIdx].Date
-				}
-			}
-			draft, err := parseTaskDraftInput(value, defaultDueDate, localToday())
+			draft, err := parseTaskDraftInput(value, defaultDueDate, defaultPriority, localToday())
 			if err != nil {
 				m.err = err
 				m.statusMsg = "Error: " + err.Error()
@@ -614,6 +777,41 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m = m.reloadTask(task)
 				}
 			}
+
+		case modeSnooze:
+			m.mode = modeNormal
+			if value == "" {
+				return m, nil
+			}
+			if m.snoozes == nil {
+				m.statusMsg = "Snooze unavailable"
+				m.statusTime = time.Now()
+				return m, nil
+			}
+			task := m.selectedTask()
+			if task == nil {
+				return m, nil
+			}
+
+			now := time.Now()
+			until, err := parseSnoozeInput(value, now)
+			if err != nil {
+				m.err = err
+				m.statusMsg = "Error: " + err.Error()
+				m.statusTime = time.Now()
+				return m, nil
+			}
+			if err := m.snoozes.Set(taskSnoozeKey(*task), until, value); err != nil {
+				m.err = err
+				m.statusMsg = "Error: " + err.Error()
+				m.statusTime = time.Now()
+				return m, nil
+			}
+
+			m.markInternalWrite("Snoozed until " + formatSnoozeUntil(until, now))
+			m.syncSnoozes()
+			m.buildViews()
+			return m, m.nextSnoozeCmd()
 		}
 		return m, nil
 	}
@@ -877,11 +1075,15 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n":
 		if m.activeView != viewLogbook {
-			m.mode = modeNewTask
-			m.input.Placeholder = "Task description #tag p1-p5 📅 amanhã"
-			m.input.SetValue("")
-			m.input.Focus()
-			return m, m.input.Cursor.BlinkCmd()
+			return m, m.openNewTaskModal("New Task", "")
+		}
+
+	case "c", "C":
+		if m.focus == focusContent && len(m.selected) == 0 {
+			task := m.selectedTask()
+			if task != nil {
+				return m, m.openNewTaskModal("Duplicate Task", m.duplicateTaskPrefill(*task))
+			}
 		}
 
 	case "e":
@@ -917,6 +1119,18 @@ func (m Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if task != nil {
 				m.mode = modeReschedule
 				m.input.Placeholder = "Date: amanhã, próxima seg, em 2 semanas, 2026-03-01"
+				m.input.SetValue("")
+				m.input.Focus()
+				return m, m.input.Cursor.BlinkCmd()
+			}
+		}
+
+	case "z":
+		if m.focus == focusContent && m.activeView != viewLogbook && len(m.selected) == 0 {
+			task := m.selectedTask()
+			if task != nil {
+				m.mode = modeSnooze
+				m.input.Placeholder = "Snooze: 3h, 2pm, 14:30, in the afternoon"
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, m.input.Cursor.BlinkCmd()
@@ -998,6 +1212,15 @@ func (m Model) View() string {
 	if m.mode == modeHelp {
 		return m.renderHelp()
 	}
+	if m.mode == modeNewTask || m.mode == modeEditTask || m.mode == modeReschedule || m.mode == modeSnooze {
+		return m.renderInputModal()
+	}
+	if m.mode == modePriority {
+		return m.renderPriorityModal()
+	}
+	if m.mode == modeConfirmDelete {
+		return m.renderConfirmDeleteModal()
+	}
 
 	totalWidth := m.width - 2*hPad - 2
 	sidebarWidth := 22
@@ -1012,33 +1235,11 @@ func (m Model) View() string {
 	footer := m.renderFooter(totalWidth)
 
 	var inputArea string
-	if m.mode == modeNewTask || m.mode == modeEditTask || m.mode == modeFilter || m.mode == modeReschedule {
-		prefix := " New: "
-		if m.mode == modeEditTask {
-			prefix = " Edit: "
-		} else if m.mode == modeFilter {
-			prefix = " Filter: "
-		} else if m.mode == modeReschedule {
-			prefix = " Reschedule: "
-		}
+	if m.mode == modeFilter {
 		prefixStyle := lipgloss.NewStyle().
 			Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
 			Bold(true)
-		inputArea = "\n" + prefixStyle.Render(prefix) + m.input.View()
-	}
-
-	if m.mode == modeConfirmDelete {
-		confirmStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color(m.cfg.Theme.Overdue)).
-			Bold(true)
-		inputArea = "\n" + confirmStyle.Render(" Cancel this task? [y/n]")
-	}
-
-	if m.mode == modePriority {
-		prStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
-			Bold(true)
-		inputArea = "\n" + prStyle.Render(" Priority: 1🔺 2⏫ 3🔼 4🔽 5⏬ 0 none")
+		inputArea = "\n" + prefixStyle.Render(" Filter: ") + m.input.View()
 	}
 
 	result := board + "\n" + footer + inputArea
@@ -1137,12 +1338,12 @@ func (m Model) renderContent(width, height int) string {
 }
 
 func (m Model) renderTodayView(maxWidth, maxHeight int) string {
-	rows, selectedLine := m.renderTodayRows(maxWidth)
-	rows = m.scrollRows(rows, selectedLine, maxHeight)
+	rows, selection := m.renderTodayRows(maxWidth)
+	rows = m.scrollRows(rows, selection, maxHeight)
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) renderTodayRows(maxWidth int) ([]string, int) {
+func (m Model) renderTodayRows(maxWidth int) ([]string, rowSelection) {
 	today := localToday()
 	titleStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
@@ -1150,13 +1351,13 @@ func (m Model) renderTodayRows(maxWidth int) ([]string, int) {
 	title := titleStyle.Render(fmt.Sprintf("  Today · %s", today.Format("Jan 02")))
 
 	rows := []string{title, ""}
-	selectedLine := -1
+	selection := noRowSelection()
 
 	isActive := m.focus == focusContent
 
 	if len(m.todayTasks) == 0 {
 		rows = append(rows, m.renderTodayEmptyState(maxWidth)...)
-		return rows, selectedLine
+		return rows, selection
 	}
 
 	selectedTaskIdx := -1
@@ -1164,19 +1365,17 @@ func (m Model) renderTodayRows(maxWidth int) ([]string, int) {
 		selectedTaskIdx = m.todayTasks[m.contentCursor]
 	}
 
-	taskRows, taskSelectedLine := m.renderPrioritySeparatedRows(m.todayTasks, maxWidth, isActive, selectedTaskIdx, func(task Task) bool {
+	taskRows, taskSelection := m.renderPrioritySeparatedRows(m.todayTasks, maxWidth, isActive, selectedTaskIdx, func(task Task) bool {
 		return isTaskOverdue(task, today)
 	})
-	if taskSelectedLine >= 0 {
-		selectedLine = len(rows) + taskSelectedLine
-	}
+	selection = shiftRowSelection(taskSelection, len(rows))
 	rows = append(rows, taskRows...)
 
-	if len(taskRows) != len(m.todayTasks) {
+	if m.showPrioritySeparators {
 		rows = append(rows, "")
 	}
 
-	return rows, selectedLine
+	return rows, selection
 }
 
 func (m Model) renderTodayEmptyState(maxWidth int) []string {
@@ -1232,17 +1431,17 @@ func (m Model) renderTodayEmptyState(maxWidth int) []string {
 }
 
 func (m Model) renderUpcomingView(maxWidth, maxHeight int) string {
-	rows, selectedLine := m.renderUpcomingRows(maxWidth)
-	rows = m.scrollRows(rows, selectedLine, maxHeight)
+	rows, selection := m.renderUpcomingRows(maxWidth)
+	rows = m.scrollRows(rows, selection, maxHeight)
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) renderUpcomingRows(maxWidth int) ([]string, int) {
+func (m Model) renderUpcomingRows(maxWidth int) ([]string, rowSelection) {
 	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.cfg.Theme.Accent)).Bold(true)
 	title := titleStyle.Render("  Upcoming")
 
 	rows := []string{title, ""}
-	selectedLine := -1
+	selection := noRowSelection()
 	isActive := m.focus == focusContent
 	selectedTaskIdx := -1
 	if isActive {
@@ -1258,7 +1457,7 @@ func (m Model) renderUpcomingRows(maxWidth int) ([]string, int) {
 			Italic(true).
 			PaddingLeft(2)
 		rows = append(rows, emptyStyle.Render("Nothing upcoming"))
-		return rows, selectedLine
+		return rows, selection
 	}
 
 	for _, g := range m.upcomingGroups {
@@ -1267,19 +1466,18 @@ func (m Model) renderUpcomingRows(maxWidth int) ([]string, int) {
 		header := fmt.Sprintf("  ── %s %s", g.Label, strings.Repeat("─", max(0, maxWidth-len(g.Label)-6)))
 		rows = append(rows, headerStyle.Render(header))
 
-		taskRows, taskLine := m.renderPrioritySeparatedRows(g.Tasks, maxWidth, isActive, selectedTaskIdx, func(Task) bool { return false })
-		if taskLine >= 0 {
-			taskLine += len(rows)
-			selectedLine = taskLine
+		taskRows, taskSelection := m.renderPrioritySeparatedRows(g.Tasks, maxWidth, isActive, selectedTaskIdx, func(Task) bool { return false })
+		if taskSelection.hasSelection() {
+			selection = shiftRowSelection(taskSelection, len(rows))
 		}
 		rows = append(rows, taskRows...)
 		rows = append(rows, "")
 	}
 
-	return rows, selectedLine
+	return rows, selection
 }
 
-func (m Model) renderLogbookRows(maxWidth int) ([]string, int) {
+func (m Model) renderLogbookRows(maxWidth int) ([]string, rowSelection) {
 	if len(m.logbookGroups) == 0 {
 		titleStyle := lipgloss.NewStyle().
 			Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
@@ -1293,7 +1491,7 @@ func (m Model) renderLogbookRows(maxWidth int) ([]string, int) {
 			"",
 			emptyStyle.Render("Logbook is empty"),
 		}
-		return rows, -1
+		return rows, noRowSelection()
 	}
 
 	g := m.logbookGroups[m.logbookDayIndex]
@@ -1331,16 +1529,17 @@ func (m Model) renderLogbookRows(maxWidth int) ([]string, int) {
 	counter := counterStyle.Render(fmt.Sprintf("  %d/%d days", m.logbookDayIndex+1, len(m.logbookGroups)))
 
 	rows := []string{"  " + title, counter, ""}
-	selectedLine := -1
+	selection := noRowSelection()
 
 	for i, taskIdx := range g.Tasks {
 		task := m.allTasks[taskIdx]
 		selected := i == m.contentCursor && isActive
 		row := m.renderLogbookTaskRow(task, selected, maxWidth)
+		rowLines := strings.Split(row, "\n")
 		if selected {
-			selectedLine = len(rows)
+			selection = rowSelection{start: len(rows), end: len(rows) + len(rowLines) - 1}
 		}
-		rows = append(rows, row)
+		rows = append(rows, rowLines...)
 	}
 
 	if len(g.Tasks) == 0 {
@@ -1351,12 +1550,12 @@ func (m Model) renderLogbookRows(maxWidth int) ([]string, int) {
 		rows = append(rows, emptyStyle.Render("No closed tasks"))
 	}
 
-	return rows, selectedLine
+	return rows, selection
 }
 
 func (m Model) renderLogbookView(maxWidth, maxHeight int) string {
-	rows, selectedLine := m.renderLogbookRows(maxWidth)
-	rows = m.scrollRows(rows, selectedLine, maxHeight)
+	rows, selection := m.renderLogbookRows(maxWidth)
+	rows = m.scrollRows(rows, selection, maxHeight)
 	return strings.Join(rows, "\n")
 }
 
@@ -1381,13 +1580,13 @@ func (m Model) renderPrioritySeparator(label string, maxWidth int, color string)
 		Render(line)
 }
 
-func (m Model) renderPrioritySeparatedRows(taskIndices []int, maxWidth int, isActive bool, selectedTaskIdx int, isOverdue func(Task) bool) ([]string, int) {
+func (m Model) renderPrioritySeparatedRows(taskIndices []int, maxWidth int, isActive bool, selectedTaskIdx int, isOverdue func(Task) bool) ([]string, rowSelection) {
 	if len(taskIndices) == 0 {
-		return nil, -1
+		return nil, noRowSelection()
 	}
 
 	var rows []string
-	selectedRow := -1
+	selection := noRowSelection()
 	previous := ""
 
 	if m.showPrioritySeparators {
@@ -1413,17 +1612,18 @@ func (m Model) renderPrioritySeparatedRows(taskIndices []int, maxWidth int, isAc
 			isOverdueTask = isOverdue(task)
 		}
 		row := m.renderTaskRow(task, selected, maxWidth, isOverdueTask, m.selected[taskIdx])
+		rowLines := strings.Split(row, "\n")
 		if selected {
-			selectedRow = len(rows)
+			selection = rowSelection{start: len(rows), end: len(rows) + len(rowLines) - 1}
 		}
-		rows = append(rows, row)
+		rows = append(rows, rowLines...)
 		previous = section
 	}
 
-	return rows, selectedRow
+	return rows, selection
 }
 
-func (m Model) scrollRows(rows []string, selectedLine int, maxHeight int) []string {
+func (m Model) scrollRows(rows []string, selection rowSelection, maxHeight int) []string {
 	if maxHeight <= 0 || len(rows) == 0 {
 		return nil
 	}
@@ -1441,12 +1641,17 @@ func (m Model) scrollRows(rows []string, selectedLine int, maxHeight int) []stri
 		offset = maxOffset
 	}
 
-	if selectedLine >= 0 {
-		if selectedLine < offset {
-			offset = selectedLine
-		}
-		if selectedLine >= offset+maxHeight {
-			offset = selectedLine - maxHeight + 1
+	if selection.hasSelection() {
+		selectionHeight := selection.end - selection.start + 1
+		if selectionHeight >= maxHeight {
+			offset = selection.start
+		} else {
+			if selection.start < offset {
+				offset = selection.start
+			}
+			if selection.end >= offset+maxHeight {
+				offset = selection.end - maxHeight + 1
+			}
 		}
 	}
 
@@ -1491,16 +1696,6 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 		Foreground(bulletColor)
 
 	desc := task.Description
-	descMaxWidth := maxWidth - 8
-	if task.Blocked {
-		descMaxWidth -= 10
-	}
-	if descMaxWidth < 10 {
-		descMaxWidth = 10
-	}
-	if len(desc) > descMaxWidth {
-		desc = desc[:descMaxWidth-3] + "..."
-	}
 
 	descStyle := lipgloss.NewStyle().PaddingLeft(1)
 	if task.IsCompleted() {
@@ -1550,6 +1745,9 @@ func (m Model) renderTaskRow(task Task, cursor bool, maxWidth int, isOverdue boo
 	if tagStr != "" {
 		line += " " + tagStr
 	}
+	if !cursor {
+		line = ansi.Truncate(line, maxWidth, "...")
+	}
 
 	rowStyle := lipgloss.NewStyle().Width(maxWidth)
 	if cursor {
@@ -1578,13 +1776,6 @@ func (m Model) renderLogbookTaskRow(task Task, selected bool, maxWidth int) stri
 		PaddingLeft(2)
 
 	desc := task.Description
-	descMaxWidth := maxWidth - 8
-	if descMaxWidth < 10 {
-		descMaxWidth = 10
-	}
-	if len(desc) > descMaxWidth {
-		desc = desc[:descMaxWidth-3] + "..."
-	}
 
 	descStyle := lipgloss.NewStyle().
 		PaddingLeft(1).
@@ -1601,6 +1792,9 @@ func (m Model) renderLogbookTaskRow(task Task, selected bool, maxWidth int) stri
 	line := bulletStyle.Render(bullet) + descStyle.Render(desc)
 	if tagStr != "" {
 		line += " " + tagStr
+	}
+	if !selected {
+		line = ansi.Truncate(line, maxWidth, "...")
 	}
 
 	rowStyle := lipgloss.NewStyle().Width(maxWidth)
@@ -1628,13 +1822,13 @@ func (m Model) renderFooter(width int) string {
 	if len(m.selected) > 0 {
 		keys = fmt.Sprintf("(%d selected) d done  b blocked  s reschedule  v toggle all  esc clear  ? help  q quit", len(m.selected))
 	} else if m.activeView == viewLogbook {
-		keys = "←/→ prev/next day  d reopen  / filter  ? help  q quit"
+		keys = "←/→ prev/next day  d reopen  c duplicate  / filter  ? help  q quit"
 	} else {
 		toggleState := "off"
 		if m.showPrioritySeparators {
 			toggleState = "on"
 		}
-		keys = fmt.Sprintf("n new  d done  b blocked  f follow-up  s reschedule  p priority  e edit  D cancel  t separators(%s)  space select  v all  / filter  ? help", toggleState)
+		keys = fmt.Sprintf("n new  c duplicate  d done  b blocked  f follow-up  s reschedule  z snooze  p priority  e edit  D cancel  t separators(%s)  space select  v all  / filter  ? help", toggleState)
 	}
 
 	keyStyle := lipgloss.NewStyle().
@@ -1651,54 +1845,141 @@ func (m Model) renderFooter(width int) string {
 	return " " + statusPart + filterInfo + keyStyle.Render(keys)
 }
 
+func (m Model) renderModal(title string, content string, width int) string {
+	if width > m.width-4 {
+		width = m.width - 4
+	}
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
+		Bold(true)
+
+	escStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Muted))
+
+	body := titleStyle.Render(title) + "\n\n" + content + "\n\n" + escStyle.Render("Esc to cancel")
+
+	boxStyle := lipgloss.NewStyle().
+		Border(subtleBorder).
+		BorderForeground(lipgloss.Color(m.cfg.Theme.Accent)).
+		Padding(1, 3).
+		Width(width)
+
+	return lipgloss.Place(m.width, m.height,
+		lipgloss.Center, lipgloss.Center,
+		boxStyle.Render(body))
+}
+
+func (m Model) renderInputModal() string {
+	var title string
+	var hint string
+
+	switch m.mode {
+	case modeNewTask:
+		title = m.newTaskTitle
+		if title == "" {
+			title = "New Task"
+		}
+		hint = "Description, #tags, p1-p5, date"
+		if token := priorityDraftToken(m.newTaskDefaultPriority); token != "" {
+			hint += " · default " + strings.ToUpper(token)
+		}
+	case modeEditTask:
+		title = "Edit Task"
+		hint = "Modify the task description"
+	case modeReschedule:
+		title = "Reschedule"
+		if len(m.selected) > 0 {
+			hint = fmt.Sprintf("New date for %d selected tasks", len(m.selected))
+		} else {
+			hint = "e.g. tomorrow, next monday, 2026-04-01"
+		}
+	case modeSnooze:
+		title = "Snooze"
+		hint = "e.g. 3h, 2pm, 14:30, afternoon"
+	}
+
+	hintStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Muted))
+
+	m.input.Width = 46
+	content := hintStyle.Render(hint) + "\n\n" + m.input.View()
+	return m.renderModal(title, content, 56)
+}
+
+func (m Model) renderPriorityModal() string {
+	options := "1  🔺  Highest\n2  ⏫  High\n3  🔼  Medium\n4  🔽  Low\n5  ⏬  Lowest\n0      None"
+	return m.renderModal("Set Priority", options, 36)
+}
+
+func (m Model) renderConfirmDeleteModal() string {
+	task := m.selectedTask()
+	desc := ""
+	if task != nil {
+		desc = task.Description
+	}
+
+	warnStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Overdue))
+
+	content := warnStyle.Render("Cancel this task?") + "\n\n"
+	if desc != "" {
+		descStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(m.cfg.Theme.Muted))
+		content += descStyle.Render(desc) + "\n\n"
+	}
+	content += "Press y to confirm, n to cancel"
+	return m.renderModal("Cancel Task", content, 50)
+}
+
 func (m Model) renderHelp() string {
-	helpText := `
-  Obsidian Tasks TUI
+	helpText := `Navigation
+  j/k  ↑/↓       Move up/down
+  h/l             Sidebar / Content
+  Tab             Toggle focus
+  1/2/3           Today / Upcoming / Logbook
+  ←/→             Logbook: prev/next day
+  Enter           Toggle done
 
-  Navigation
-    j/k  ↑/↓       Move up/down
-    h/l             Sidebar / Content
-    Tab             Toggle focus
-    1/2/3           Today / Upcoming / Logbook
-    ←/→             Logbook: prev/next day
-    Enter           Toggle done
+Actions
+  n               New task
+  c               Duplicate task into a new draft
+  e               Edit task
+  d               Toggle done/reopen
+  b               Toggle blocked
+  f               Create follow-up for tomorrow
+  s               Reschedule task
+  z               Snooze task
+  p               Set priority
+  t               Toggle priority separators
+  D               Cancel task
+  /               Filter by text
+  r               Reload from files
 
-  Actions
-    n               New task
-    e               Edit task
-    d               Toggle done/reopen
-    b               Toggle blocked
-    f               Create follow-up for tomorrow
-    s               Reschedule task
-    p               Set priority
-    t               Toggle priority separators
-    D               Cancel task
-    /               Filter by text
-    r               Reload from files
+Bulk Selection
+  Space           Toggle select
+  v               Select/deselect all
+  d               Mark selected done
+  b               Toggle selected blocked
+  s               Reschedule selected
 
-  Sync
-    Auto-sync       Reloads when daily note files change
-    r               Manual fallback reload
+Press any key to close.`
 
-  Bulk Selection
-    Space           Toggle select
-    v               Select/deselect all
-    d               Mark selected done
-    b               Toggle selected blocked
-    s               Reschedule selected
-    Esc             Clear selection
+	titleStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.cfg.Theme.Accent)).
+		Bold(true)
 
-  Press any key to close.
-`
-	style := lipgloss.NewStyle().
+	boxStyle := lipgloss.NewStyle().
 		Border(subtleBorder).
 		BorderForeground(lipgloss.Color(m.cfg.Theme.Accent)).
 		Padding(1, 4).
 		Width(56)
 
+	body := titleStyle.Render("Obsidian Tasks TUI") + "\n\n" + helpText
+
 	return lipgloss.Place(m.width, m.height,
 		lipgloss.Center, lipgloss.Center,
-		style.Render(helpText))
+		boxStyle.Render(body))
 }
 
 func parseRelativeDate(input string) (time.Time, error) {
