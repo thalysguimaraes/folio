@@ -1,18 +1,26 @@
-# Obsidian Tasks TUI
+<div align="center">
+  <img src="assets/symbol.png" alt="Folio" width="128" height="128" />
 
-A terminal UI for managing [Obsidian Tasks](https://publish.obsidian.md/tasks/Introduction) directly from your daily notes — inspired by [Things 3](https://culturedcode.com/things/).
+  # Folio
+
+  A keyboard-first terminal UI for managing [Obsidian Tasks](https://publish.obsidian.md/tasks/Introduction) straight from your daily notes.
+
+  <sub>Inspired by <a href="https://culturedcode.com/things/">Things 3</a>. Built for people who live in their vault.</sub>
+</div>
+
+---
 
 ```
 +--------------++---------------------------------------------+
 |              ||                                             |
 |  * Today  3  ||  Today . Feb 28                             |
 |  > Upcoming  ||                                             |
-|  > Logbook   ||  o Fix login bug                   #work   |
+|  > Logbook   ||  o Fix login bug                   #work    |
 |              ||  o Call dentist                #personal    |
-|              ||  * Send invoice          #work  + today    |
+|              ||  * Send invoice          #work  + today     |
 |              ||                                             |
-|              ||  -- Overdue -------------------------------- |
-|              ||  o Review PR from Feb 26          #work    |
+|              ||  -- Overdue ------------------------------- |
+|              ||  o Review PR from Feb 26          #work     |
 |              ||                                             |
 +--------------++---------------------------------------------+
  n new  d done  f follow-up  e edit  / filter  ? help  q quit
@@ -32,20 +40,20 @@ A terminal UI for managing [Obsidian Tasks](https://publish.obsidian.md/tasks/In
 ## Install
 
 ```bash
-go install github.com/thalysguimaraes/obsidian-tasks-tui@latest
+go install github.com/thalysguimaraes/folio@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/thalysguimaraes/obsidian-tasks-tui
-cd obsidian-tasks-tui
+git clone https://github.com/thalysguimaraes/folio
+cd folio
 go build
 ```
 
 ## Configuration
 
-Create `~/.config/obsidian-tasks/config.toml`:
+Create `~/.config/folio/config.toml`:
 
 ```toml
 [vault]
@@ -69,6 +77,8 @@ muted = "#555555"
 ```
 
 The only required field is `vault.path`. Everything else has sensible defaults.
+
+> **Migrating from `obsidian-tasks-tui`?** Move your config from `~/.config/obsidian-tasks/config.toml` to `~/.config/folio/config.toml`.
 
 ## Keybindings
 
@@ -106,4 +116,8 @@ Due dates accept natural language: `📅 amanha`, `due next mon`, `em 2 semanas`
 
 ## License
 
-MIT
+[MIT](LICENSE)
+
+---
+
+<sub>Folio was previously published as <a href="https://github.com/thalysguimaraes/folio">obsidian-tasks-tui</a>. GitHub redirects the old URL automatically.</sub>

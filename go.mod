@@ -1,4 +1,4 @@
-module github.com/thalysguimaraes/obsidian-tasks-tui
+module github.com/thalysguimaraes/folio
 
 go 1.25.5
 

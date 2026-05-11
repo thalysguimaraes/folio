@@ -167,7 +167,7 @@ done = "#02BF87"
 ## Build & Install
 
 ```bash
-cd ~/Projects/obsidian-tasks-tui
+cd ~/Projects/folio
 go build -o obsidian-tasks .
 # or: go install .
 ```
